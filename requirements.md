@@ -1,6 +1,6 @@
 # Requirements
 
-System-level dependencies for the `sandbox` wrapper. NixOS-focused; generalizes to other Linux via equivalent packages.
+System-level dependencies for the `agentpen` wrapper. NixOS-focused; generalizes to other Linux via equivalent packages.
 
 ## Already installed (PR #33 + base NixOS)
 

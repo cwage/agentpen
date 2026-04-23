@@ -12,7 +12,7 @@ import (
 // stageEtc builds a per-run /etc directory copied from host /etc with pinned
 // hosts entries and a blank resolv.conf. Returned path must be rm -rf'd by caller.
 func stageEtc(allowedHosts []string, hostIPs map[string]string) (string, error) {
-	dir, err := os.MkdirTemp("", "sbx-etc-*")
+	dir, err := os.MkdirTemp("", "agentpen-etc-*")
 	if err != nil {
 		return "", err
 	}
@@ -67,7 +67,7 @@ func bwrapArgs(cfg runConfig, stageEtcPath string) []string {
 	}
 	args := []string{
 		"--unshare-user", "--unshare-ipc", "--unshare-pid", "--unshare-uts", "--unshare-cgroup",
-		"--die-with-parent", "--new-session", "--hostname", "sandbox",
+		"--die-with-parent", "--new-session", "--hostname", "agentpen",
 		"--clearenv",
 		"--setenv", "HOME", cfg.Home,
 		"--setenv", "USER", cfg.User,

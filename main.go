@@ -36,8 +36,8 @@ type runConfig struct {
 func usage() {
 	known := knownAgents()
 	sort.Strings(known)
-	fmt.Fprintf(os.Stderr, `usage: sandbox [options] [--] <command> [args...]
-       sandbox --check
+	fmt.Fprintf(os.Stderr, `usage: agentpen [options] [--] <command> [args...]
+       agentpen --check
 
 Runs <command> inside a confined sandbox (bwrap + netns + nftables + seccomp).
 
@@ -58,7 +58,7 @@ known agents: %s
 
 func main() {
 	if err := run(); err != nil {
-		fmt.Fprintln(os.Stderr, "sandbox:", err)
+		fmt.Fprintln(os.Stderr, "agentpen:", err)
 		os.Exit(1)
 	}
 }
@@ -75,7 +75,7 @@ func run() error {
 		check      bool
 	)
 
-	fs := flag.NewFlagSet("sandbox", flag.ContinueOnError)
+	fs := flag.NewFlagSet("agentpen", flag.ContinueOnError)
 	fs.Usage = usage
 	fs.StringVar(&profile, "profile", "untrusted", "")
 	fs.StringVar(&agent, "agent", "", "")
@@ -116,7 +116,7 @@ func run() error {
 	// Validate capabilities up front (fail-closed).
 	caps := detectCapabilities()
 	if err := caps.ValidateFor(profile); err != nil {
-		return fmt.Errorf("%w\nrun 'sandbox --check' for details", err)
+		return fmt.Errorf("%w\nrun 'agentpen --check' for details", err)
 	}
 
 	// Agent inference

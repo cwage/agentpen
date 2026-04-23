@@ -1,4 +1,4 @@
-module github.com/cwage/sandbox
+module github.com/cwage/agentpen
 
 go 1.26.1
 

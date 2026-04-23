@@ -107,7 +107,7 @@ func serializeFilter(filter []unix.SockFilter) []byte {
 // writeSeccompFilter writes the BPF filter to a temp file and returns its path.
 // Caller is responsible for cleanup.
 func writeSeccompFilter() (string, error) {
-	f, err := os.CreateTemp("", "sbx-seccomp-*.bpf")
+	f, err := os.CreateTemp("", "agentpen-seccomp-*.bpf")
 	if err != nil {
 		return "", err
 	}

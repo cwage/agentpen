@@ -20,7 +20,7 @@ type Netns struct {
 
 func newNetns(suffix string) Netns {
 	return Netns{
-		Name:   "sbx-" + suffix,
+		Name:   "ap-" + suffix,
 		HostIP: "10.200.99.1",
 		SbxIP:  "10.200.99.2",
 		Subnet: "10.200.99.0/24",
@@ -79,7 +79,7 @@ func (n *Netns) setup(allowedIPs []string) error {
 
 func (n *Netns) loadNft(allowedIPs []string) error {
 	var b strings.Builder
-	b.WriteString("table inet sbx {\n")
+	b.WriteString("table inet agentpen {\n")
 	b.WriteString("    chain output {\n")
 	b.WriteString("        type filter hook output priority 0; policy drop;\n")
 	b.WriteString("        ct state established,related accept\n")
@@ -90,7 +90,7 @@ func (n *Netns) loadNft(allowedIPs []string) error {
 	b.WriteString("    }\n")
 	b.WriteString("}\n")
 
-	f, err := os.CreateTemp("", "sbx-nft-*.nft")
+	f, err := os.CreateTemp("", "agentpen-nft-*.nft")
 	if err != nil {
 		return err
 	}

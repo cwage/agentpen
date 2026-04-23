@@ -113,7 +113,7 @@ Outer layers are the primary defense, not defense-in-depth. `/sandbox` is a bonu
 - Network filtering: netns + nftables IP allowlist, resolved from hostname at wrapper startup. Upgrade to DNS+ipset or SNI proxy if CDN rotation proves flaky.
 - Agent-aware endpoints + credentials: built-in per-agent registry (allowed hosts, env-var passthrough list, config mount paths). `claude` registry entry must include `api.anthropic.com`, `platform.claude.com`, `console.anthropic.com`, and mount both `~/.claude/` and `~/.claude.json`.
 - Agent config mounts are RW in MVP (agents need to refresh OAuth tokens / persist state). Moves back to RO in phase 2 once the proxy handles credentials externally.
-- Tool name: `sandbox` as a working name; rename later.
+- Tool name: `agentpen`.
 - Language: Go (rewrite decided after bash MVP was proven end-to-end). Single binary for the rewrite; privileged-helper split is its own later milestone.
 - Build: no Docker. Use `nix shell nixpkgs#go gopls` ad-hoc for dev; a `flake.nix` later if the build step grows. GitHub Actions will use `actions/setup-go` when we publish, not Docker.
 - Cross-distro portability: the real work is parameterizing FS bind mounts for non-NixOS (FHS layout detection), not the build system. Bake into the Go rewrite from the start.
@@ -129,14 +129,14 @@ Not yet implemented. Capturing now so future code stays refactor-friendly.
 - *Degradable layers:* network filter (nft preferred, iptables fallback, neither available ⇒ offline-only or explicit opt-out), seccomp (optional), cgroup caps (optional).
 
 **Surface to build:**
-- `sandbox --check` (or similar) — capability report: for the current host, enumerate which layers are available and which would be enforced. Small feature, high clarity value. Good onboarding / CI / debugging aid.
+- `agentpen --check` — capability report: for the current host, enumerate which layers are available and which would be enforced. Small feature, high clarity value. Good onboarding / CI / debugging aid.
 - `--best-effort` (or similar) flag — explicit opt-in to run with fewer protections than the profile requests. Prints a loud warning summarizing what's off. Without it, missing layers cause a refuse-to-run error with install hints.
 
 **Design constraint for the current code:** keep "detect capability" and "apply layer" factored out so each layer can be toggled independently. The current Go code has netns setup hardcoded into `main.run()`; before we add seccomp or cgroup layers, refactor so the orchestration looks like a pipeline of layer-appliers driven by a capabilities struct. Avoid threading individual booleans through the call chain.
 
 ## MVP status
 
-End-to-end proven: `sandbox claude` in a clean repo successfully confines claude, blocks SSH/AWS/sibling-repo reads, allows Anthropic endpoints. Implementation is Go, built via `nix develop --command go build .`, output at `./sandbox`.
+End-to-end proven: `agentpen claude` in a clean repo successfully confines claude, blocks SSH/AWS/sibling-repo reads, allows Anthropic endpoints. Implementation is Go, built via `nix develop --command go build .`, output at `./agentpen`.
 
 Files: `main.go` (CLI), `agents.go` (registry), `host.go` (NixOS/FHS layout detection), `network.go` (netns/veth/nft), `fs.go` (/etc staging + bwrap argv), `flake.nix` (dev shell).
 
