@@ -65,6 +65,14 @@ func bwrapArgs(cfg runConfig, stageEtcPath string) []string {
 	if err != nil {
 		shell = "/bin/sh"
 	}
+	// Follow the standard Linux .profile convention: ~/.local/bin wins over
+	// system dirs when present. Lets user-local agent installs be found by
+	// name inside the sandbox (the binary itself is bound via auto-mount).
+	pathEnv := layout.PathEnv
+	userLocalBin := filepath.Join(cfg.Home, ".local", "bin")
+	if info, err := os.Stat(userLocalBin); err == nil && info.IsDir() {
+		pathEnv = userLocalBin + ":" + pathEnv
+	}
 	args := []string{
 		"--unshare-user", "--unshare-ipc", "--unshare-pid", "--unshare-uts", "--unshare-cgroup",
 		"--die-with-parent", "--new-session", "--hostname", "agentpen",
@@ -74,7 +82,7 @@ func bwrapArgs(cfg runConfig, stageEtcPath string) []string {
 		"--setenv", "LOGNAME", cfg.User,
 		"--setenv", "SHELL", shell,
 		"--setenv", "TERM", orDefault(os.Getenv("TERM"), "xterm-256color"),
-		"--setenv", "PATH", layout.PathEnv,
+		"--setenv", "PATH", pathEnv,
 		"--setenv", "LANG", orDefault(os.Getenv("LANG"), "C.UTF-8"),
 		"--proc", "/proc",
 		"--dev", "/dev",

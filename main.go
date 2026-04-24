@@ -157,6 +157,16 @@ func run() error {
 		return fmt.Errorf("refusing to use %s as project dir", projectDir)
 	}
 
+	// Resolve the agent binary on the host before the sandbox starts: follow
+	// symlinks and collect any dirs that need to be bound so the binary stays
+	// reachable inside (user-local installs like ~/.local/bin/claude → ~/.local/share/...
+	// would otherwise vanish with the tmpfs'd $HOME).
+	layout := detectHostLayout()
+	resolvedCmd, autoMounts, err := resolveCommand(command, layout)
+	if err != nil {
+		return err
+	}
+
 	// Merge registry + user-supplied
 	cfg := runConfig{
 		Profile:       profile,
@@ -164,9 +174,9 @@ func run() error {
 		ProjectDir:    projectDir,
 		Home:          home,
 		User:          user,
-		Command:       command,
-		HostLayout:    detectHostLayout(),
-		ExtraROMounts: mountRO,
+		Command:       resolvedCmd,
+		HostLayout:    layout,
+		ExtraROMounts: append(mountRO, autoMounts...),
 		ExtraRWMounts: mountRW,
 	}
 	if agent != "" {
