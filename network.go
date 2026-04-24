@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -119,29 +120,31 @@ func (n *Netns) loadNft(allowedIPs []string) error {
 	return sudoRun("ip", "netns", "exec", n.Name, "nft", "-f", f.Name())
 }
 
-// teardown is best-effort and swallows errors (cleanup should never fail the run).
-func (n *Netns) teardown() {
-	_ = sudoRunQuiet("ip", "netns", "del", n.Name)
-	_ = sudoRunQuiet("ip", "link", "del", n.VethH)
-	_ = sudoRunQuiet("iptables", "-t", "nat", "-D", "POSTROUTING", "-s", n.Subnet, "-j", "MASQUERADE")
+// teardown removes the netns, host-side veth, and MASQUERADE rule. Returns
+// an aggregated error if any step failed; callers doing cleanup-on-exit
+// typically discard it, but the reaper uses it to avoid claiming success
+// on partial failures.
+func (n *Netns) teardown() error {
+	var errs []error
+	if err := sudoRunQuiet("ip", "netns", "del", n.Name); err != nil {
+		errs = append(errs, fmt.Errorf("del netns: %w", err))
+	}
+	if err := sudoRunQuiet("ip", "link", "del", n.VethH); err != nil {
+		errs = append(errs, fmt.Errorf("del veth: %w", err))
+	}
+	if err := sudoRunQuiet("iptables", "-t", "nat", "-D", "POSTROUTING",
+		"-s", n.Subnet, "-j", "MASQUERADE"); err != nil {
+		errs = append(errs, fmt.Errorf("del masquerade: %w", err))
+	}
+	return errors.Join(errs...)
 }
 
-// reapOrphans walks `ip netns list`, finds any `ap-<pid>` namespaces whose
-// owning process no longer exists, and tears them down (netns + host veth +
-// MASQUERADE rule). Required because defer-based teardown doesn't run on
-// SIGKILL, power loss, or panic — leaked veths with duplicate IPs on the
-// host would otherwise break the next session's return-path routing.
-//
-// Caller must have a valid sudo ticket. Silent on success; returns the list
-// of reaped names for the caller to log if desired.
-func reapOrphans() ([]string, error) {
-	out, err := exec.Command("ip", "netns", "list").Output()
-	if err != nil {
-		// No netns support, no permissions, or empty — nothing to reap.
-		return nil, nil
-	}
-	var reaped []string
-	for _, line := range strings.Split(string(out), "\n") {
+// parseOrphanCandidates extracts candidate pids from `ip netns list` output.
+// Skips blank lines, non-`ap-*` names, and `ap-*` names whose suffix isn't
+// an integer. Pure for easy testing.
+func parseOrphanCandidates(listing string) []int {
+	var pids []int
+	for _, line := range strings.Split(listing, "\n") {
 		fields := strings.Fields(line)
 		if len(fields) == 0 {
 			continue
@@ -154,13 +157,53 @@ func reapOrphans() ([]string, error) {
 		if err != nil {
 			continue
 		}
-		// /proc/<pid> exists for any live process; absent means dead.
-		if _, err := os.Stat(fmt.Sprintf("/proc/%d", pid)); err == nil {
+		pids = append(pids, pid)
+	}
+	return pids
+}
+
+// isAgentpenAlive returns true iff /proc/<pid>/comm reads as "agentpen".
+// Returning true on ambiguous errors (hidepid, transient I/O) is the
+// fail-safe choice — better to leak a namespace than wrongly tear down a
+// live session. Only treats os.ErrNotExist as definitively dead.
+func isAgentpenAlive(pid int) bool {
+	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/comm", pid))
+	if errors.Is(err, os.ErrNotExist) {
+		return false
+	}
+	if err != nil {
+		return true
+	}
+	return strings.TrimSpace(string(data)) == "agentpen"
+}
+
+// reapOrphans walks `ip netns list`, finds any `ap-<pid>` namespaces whose
+// owning agentpen process no longer exists, and tears them down (netns +
+// host veth + MASQUERADE rule). Required because defer-based teardown
+// doesn't run on SIGKILL, power loss, or panic — leaked veths with
+// duplicate IPs on the host would otherwise break the next session's
+// return-path routing.
+//
+// Caller must have a valid sudo ticket. Runs the listing under sudo too,
+// since some hardened distros restrict /var/run/netns. Returns only
+// namespaces whose teardown fully succeeded; per-namespace failures are
+// logged to stderr so partial reap is visible.
+func reapOrphans() ([]string, error) {
+	out, err := exec.Command("sudo", "-n", "ip", "netns", "list").Output()
+	if err != nil {
+		return nil, fmt.Errorf("list netns: %w", err)
+	}
+	var reaped []string
+	for _, pid := range parseOrphanCandidates(string(out)) {
+		if isAgentpenAlive(pid) {
 			continue
 		}
 		ns := newNetns(pid)
-		ns.teardown()
-		reaped = append(reaped, name)
+		if err := ns.teardown(); err != nil {
+			fmt.Fprintf(os.Stderr, "agentpen: reap %s: %v\n", ns.Name, err)
+			continue
+		}
+		reaped = append(reaped, ns.Name)
 	}
 	return reaped, nil
 }

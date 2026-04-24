@@ -224,9 +224,11 @@ func run() error {
 		return fmt.Errorf("sudo: %w", err)
 	}
 
-	// Auto-reap orphans from crashed/killed prior runs. Silent on nothing,
-	// short notice when it cleans anything so the user knows it happened.
-	if reaped, _ := reapOrphans(); len(reaped) > 0 {
+	// Auto-reap orphans from crashed/killed prior runs. Surface listing errors
+	// as warnings but proceed — a failed reap shouldn't block a new run.
+	if reaped, err := reapOrphans(); err != nil {
+		fmt.Fprintf(os.Stderr, "agentpen: auto-reap skipped: %v\n", err)
+	} else if len(reaped) > 0 {
 		fmt.Fprintf(os.Stderr, "agentpen: reaped %d leaked namespace(s): %s\n",
 			len(reaped), strings.Join(reaped, " "))
 	}
@@ -234,7 +236,7 @@ func run() error {
 	// Netns setup
 	ns := newNetns(os.Getpid())
 	cleanup := func() {
-		ns.teardown()
+		_ = ns.teardown()
 	}
 	defer cleanup()
 	// Also clean on signal
