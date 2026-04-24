@@ -1,10 +1,12 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 )
 
@@ -18,12 +20,22 @@ type Netns struct {
 	VethS  string
 }
 
-func newNetns(suffix string) Netns {
+// newNetns derives a per-session /24 from the pid's third octet so two
+// concurrent agentpen runs don't both claim 10.200.99.0/24 — the host would
+// end up with two directly-connected routes for the same subnet and reply
+// packets would coin-flip between the veths. 254 buckets is plenty for any
+// realistic concurrency on a workstation; collision across generations is
+// naturally resolved by the startup reaper (dead session's netns gets torn
+// down before a new one tries the same octet).
+func newNetns(pid int) Netns {
+	octet := (pid % 254) + 1
+	prefix := fmt.Sprintf("10.200.%d", octet)
+	suffix := strconv.Itoa(pid)
 	return Netns{
 		Name:   "ap-" + suffix,
-		HostIP: "10.200.99.1",
-		SbxIP:  "10.200.99.2",
-		Subnet: "10.200.99.0/24",
+		HostIP: prefix + ".1",
+		SbxIP:  prefix + ".2",
+		Subnet: prefix + ".0/24",
 		VethH:  "vh-" + suffix,
 		VethS:  "vs-" + suffix,
 	}
@@ -87,6 +99,10 @@ func (n *Netns) loadNft(allowedIPs []string) error {
 	for _, ip := range allowedIPs {
 		fmt.Fprintf(&b, "        ip daddr %s accept\n", ip)
 	}
+	// Reject non-allowed TCP with RST so callers fail in milliseconds instead
+	// of sitting in the kernel's ~75s SYN-retry window. Non-TCP falls through
+	// to policy drop (DNS is already blocked at resolv.conf, so rare).
+	b.WriteString("        meta l4proto tcp reject with tcp reset\n")
 	b.WriteString("    }\n")
 	b.WriteString("}\n")
 
@@ -104,11 +120,99 @@ func (n *Netns) loadNft(allowedIPs []string) error {
 	return sudoRun("ip", "netns", "exec", n.Name, "nft", "-f", f.Name())
 }
 
-// teardown is best-effort and swallows errors (cleanup should never fail the run).
-func (n *Netns) teardown() {
-	_ = sudoRunQuiet("ip", "netns", "del", n.Name)
-	_ = sudoRunQuiet("ip", "link", "del", n.VethH)
-	_ = sudoRunQuiet("iptables", "-t", "nat", "-D", "POSTROUTING", "-s", n.Subnet, "-j", "MASQUERADE")
+// teardown removes the netns, host-side veth, and MASQUERADE rule. Returns
+// an aggregated error if any step failed; callers doing cleanup-on-exit
+// typically discard it, but the reaper uses it to avoid claiming success
+// on partial failures.
+func (n *Netns) teardown() error {
+	var errs []error
+	if err := sudoRunQuiet("ip", "netns", "del", n.Name); err != nil {
+		errs = append(errs, fmt.Errorf("del netns: %w", err))
+	}
+	if err := sudoRunQuiet("ip", "link", "del", n.VethH); err != nil {
+		errs = append(errs, fmt.Errorf("del veth: %w", err))
+	}
+	if err := sudoRunQuiet("iptables", "-t", "nat", "-D", "POSTROUTING",
+		"-s", n.Subnet, "-j", "MASQUERADE"); err != nil {
+		errs = append(errs, fmt.Errorf("del masquerade: %w", err))
+	}
+	return errors.Join(errs...)
+}
+
+// parseOrphanCandidates extracts candidate pids from `ip netns list` output.
+// Skips blank lines, non-`ap-*` names, and `ap-*` names whose suffix isn't
+// an integer. Pure for easy testing.
+func parseOrphanCandidates(listing string) []int {
+	var pids []int
+	for _, line := range strings.Split(listing, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) == 0 {
+			continue
+		}
+		name := fields[0]
+		if !strings.HasPrefix(name, "ap-") {
+			continue
+		}
+		pid, err := strconv.Atoi(strings.TrimPrefix(name, "ap-"))
+		if err != nil {
+			continue
+		}
+		pids = append(pids, pid)
+	}
+	return pids
+}
+
+// isAgentpenAlive returns true iff /proc/<pid>/comm begins with "agentpen".
+// Prefix match (not equality) so renamed/symlinked builds like agentpen-dev
+// don't look "dead" to a concurrent session and get reaped. Kernel truncates
+// comm to 15 chars so "agentpen" always fits at the start.
+//
+// Returning true on ambiguous errors (hidepid, transient I/O) is the fail-safe
+// choice — better to leak a namespace than wrongly tear down a live session.
+// Only treats os.ErrNotExist as definitively dead.
+func isAgentpenAlive(pid int) bool {
+	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/comm", pid))
+	if errors.Is(err, os.ErrNotExist) {
+		return false
+	}
+	if err != nil {
+		return true
+	}
+	return strings.HasPrefix(strings.TrimSpace(string(data)), "agentpen")
+}
+
+// reapOrphans walks `ip netns list`, finds any `ap-<pid>` namespaces whose
+// owning agentpen process no longer exists, and tears them down (netns +
+// host veth + MASQUERADE rule). Required because defer-based teardown
+// doesn't run on SIGKILL, power loss, or panic — leaked veths with
+// duplicate IPs on the host would otherwise break the next session's
+// return-path routing.
+//
+// Caller must have a valid sudo ticket. Runs the listing under sudo too,
+// since some hardened distros restrict /var/run/netns. Returns only
+// namespaces whose teardown fully succeeded; per-namespace failures are
+// logged to stderr so partial reap is visible.
+func reapOrphans() ([]string, error) {
+	out, err := exec.Command("sudo", "-n", "ip", "netns", "list").CombinedOutput()
+	if err != nil {
+		if msg := strings.TrimSpace(string(out)); msg != "" {
+			return nil, fmt.Errorf("list netns: %w: %s", err, msg)
+		}
+		return nil, fmt.Errorf("list netns: %w", err)
+	}
+	var reaped []string
+	for _, pid := range parseOrphanCandidates(string(out)) {
+		if isAgentpenAlive(pid) {
+			continue
+		}
+		ns := newNetns(pid)
+		if err := ns.teardown(); err != nil {
+			fmt.Fprintf(os.Stderr, "agentpen: reap %s: %v\n", ns.Name, err)
+			continue
+		}
+		reaped = append(reaped, ns.Name)
+	}
+	return reaped, nil
 }
 
 // sudoRun runs `sudo <args...>` with inherited stdio.
