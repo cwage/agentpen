@@ -8,7 +8,6 @@ import (
 	"os/signal"
 	"path/filepath"
 	"sort"
-	"strconv"
 	"strings"
 	"syscall"
 )
@@ -39,6 +38,7 @@ func usage() {
 	sort.Strings(known)
 	fmt.Fprintf(os.Stderr, `usage: agentpen [options] [--] <command> [args...]
        agentpen --check
+       agentpen --reap
 
 Runs <command> inside a confined sandbox (bwrap + netns + nftables + seccomp).
 
@@ -51,6 +51,7 @@ options:
   --mount-rw PATH  extra read-write bind mount (repeatable)
   --project DIR    project dir, bound RW (default: $PWD)
   --check          report which sandbox layers this host can enforce and exit
+  --reap           tear down leaked ap-* netns from crashed/killed prior runs
   -h, --help       show this help
 
 known agents: %s
@@ -74,6 +75,7 @@ func run() error {
 		mountRO    stringList
 		mountRW    stringList
 		check      bool
+		reap       bool
 	)
 
 	fs := flag.NewFlagSet("agentpen", flag.ContinueOnError)
@@ -86,6 +88,7 @@ func run() error {
 	fs.Var(&mountRO, "mount", "")
 	fs.Var(&mountRW, "mount-rw", "")
 	fs.BoolVar(&check, "check", false, "")
+	fs.BoolVar(&reap, "reap", false, "")
 
 	if err := fs.Parse(os.Args[1:]); err != nil {
 		if err == flag.ErrHelp {
@@ -97,6 +100,23 @@ func run() error {
 	// --check: report capabilities and exit without running anything
 	if check {
 		fmt.Print(detectCapabilities().Report(profile))
+		return nil
+	}
+
+	// --reap: tear down leaked namespaces from prior crashed/killed runs
+	if reap {
+		if err := sudoRun("-v"); err != nil {
+			return fmt.Errorf("sudo: %w", err)
+		}
+		reaped, err := reapOrphans()
+		if err != nil {
+			return err
+		}
+		if len(reaped) == 0 {
+			fmt.Println("no orphaned agentpen namespaces found")
+		} else {
+			fmt.Printf("reaped %d orphan(s): %s\n", len(reaped), strings.Join(reaped, " "))
+		}
 		return nil
 	}
 
@@ -204,8 +224,15 @@ func run() error {
 		return fmt.Errorf("sudo: %w", err)
 	}
 
+	// Auto-reap orphans from crashed/killed prior runs. Silent on nothing,
+	// short notice when it cleans anything so the user knows it happened.
+	if reaped, _ := reapOrphans(); len(reaped) > 0 {
+		fmt.Fprintf(os.Stderr, "agentpen: reaped %d leaked namespace(s): %s\n",
+			len(reaped), strings.Join(reaped, " "))
+	}
+
 	// Netns setup
-	ns := newNetns(strconv.Itoa(os.Getpid()))
+	ns := newNetns(os.Getpid())
 	cleanup := func() {
 		ns.teardown()
 	}

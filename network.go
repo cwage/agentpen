@@ -5,6 +5,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 )
 
@@ -18,12 +19,22 @@ type Netns struct {
 	VethS  string
 }
 
-func newNetns(suffix string) Netns {
+// newNetns derives a per-session /24 from the pid's third octet so two
+// concurrent agentpen runs don't both claim 10.200.99.0/24 — the host would
+// end up with two directly-connected routes for the same subnet and reply
+// packets would coin-flip between the veths. 254 buckets is plenty for any
+// realistic concurrency on a workstation; collision across generations is
+// naturally resolved by the startup reaper (dead session's netns gets torn
+// down before a new one tries the same octet).
+func newNetns(pid int) Netns {
+	octet := (pid % 254) + 1
+	prefix := fmt.Sprintf("10.200.%d", octet)
+	suffix := strconv.Itoa(pid)
 	return Netns{
 		Name:   "ap-" + suffix,
-		HostIP: "10.200.99.1",
-		SbxIP:  "10.200.99.2",
-		Subnet: "10.200.99.0/24",
+		HostIP: prefix + ".1",
+		SbxIP:  prefix + ".2",
+		Subnet: prefix + ".0/24",
 		VethH:  "vh-" + suffix,
 		VethS:  "vs-" + suffix,
 	}
@@ -87,6 +98,10 @@ func (n *Netns) loadNft(allowedIPs []string) error {
 	for _, ip := range allowedIPs {
 		fmt.Fprintf(&b, "        ip daddr %s accept\n", ip)
 	}
+	// Reject non-allowed TCP with RST so callers fail in milliseconds instead
+	// of sitting in the kernel's ~75s SYN-retry window. Non-TCP falls through
+	// to policy drop (DNS is already blocked at resolv.conf, so rare).
+	b.WriteString("        meta l4proto tcp reject with tcp reset\n")
 	b.WriteString("    }\n")
 	b.WriteString("}\n")
 
@@ -109,6 +124,45 @@ func (n *Netns) teardown() {
 	_ = sudoRunQuiet("ip", "netns", "del", n.Name)
 	_ = sudoRunQuiet("ip", "link", "del", n.VethH)
 	_ = sudoRunQuiet("iptables", "-t", "nat", "-D", "POSTROUTING", "-s", n.Subnet, "-j", "MASQUERADE")
+}
+
+// reapOrphans walks `ip netns list`, finds any `ap-<pid>` namespaces whose
+// owning process no longer exists, and tears them down (netns + host veth +
+// MASQUERADE rule). Required because defer-based teardown doesn't run on
+// SIGKILL, power loss, or panic — leaked veths with duplicate IPs on the
+// host would otherwise break the next session's return-path routing.
+//
+// Caller must have a valid sudo ticket. Silent on success; returns the list
+// of reaped names for the caller to log if desired.
+func reapOrphans() ([]string, error) {
+	out, err := exec.Command("ip", "netns", "list").Output()
+	if err != nil {
+		// No netns support, no permissions, or empty — nothing to reap.
+		return nil, nil
+	}
+	var reaped []string
+	for _, line := range strings.Split(string(out), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) == 0 {
+			continue
+		}
+		name := fields[0]
+		if !strings.HasPrefix(name, "ap-") {
+			continue
+		}
+		pid, err := strconv.Atoi(strings.TrimPrefix(name, "ap-"))
+		if err != nil {
+			continue
+		}
+		// /proc/<pid> exists for any live process; absent means dead.
+		if _, err := os.Stat(fmt.Sprintf("/proc/%d", pid)); err == nil {
+			continue
+		}
+		ns := newNetns(pid)
+		ns.teardown()
+		reaped = append(reaped, name)
+	}
+	return reaped, nil
 }
 
 // sudoRun runs `sudo <args...>` with inherited stdio.
