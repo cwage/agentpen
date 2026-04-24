@@ -29,6 +29,7 @@ type runConfig struct {
 	Mounts        []string
 	ExtraROMounts []string
 	ExtraRWMounts []string
+	AutoMounts    []string
 	Command       []string
 	HostLayout    HostLayout
 }
@@ -176,8 +177,9 @@ func run() error {
 		User:          user,
 		Command:       resolvedCmd,
 		HostLayout:    layout,
-		ExtraROMounts: append(mountRO, autoMounts...),
+		ExtraROMounts: mountRO,
 		ExtraRWMounts: mountRW,
+		AutoMounts:    autoMounts,
 	}
 	if agent != "" {
 		a := agents[agent]

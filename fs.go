@@ -96,6 +96,14 @@ func bwrapArgs(cfg runConfig, stageEtcPath string) []string {
 			args = append(args, "--ro-bind", p, p)
 		}
 	}
+	// Auto-mounts (from resolveCommand) bind RO before the project dir and any
+	// explicit RW mounts — bwrap is order-sensitive, so later RW binds override
+	// here if a caller invokes a binary from inside the project dir.
+	for _, p := range cfg.AutoMounts {
+		if _, err := os.Stat(p); err == nil {
+			args = append(args, "--ro-bind", p, p)
+		}
+	}
 	args = append(args, "--bind", cfg.ProjectDir, cfg.ProjectDir, "--chdir", cfg.ProjectDir)
 
 	// Forward env vars that are set on the host
