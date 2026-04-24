@@ -1,0 +1,11 @@
+services:
+  build:
+    image: golang:1.26
+    user: "${UID:-1000}:${GID:-1000}"
+    working_dir: /src
+    volumes:
+      - .:/src
+    environment:
+      GOCACHE: /src/.cache/go-build
+      GOMODCACHE: /src/.cache/go-mod
+    command: go build -o agentpen .

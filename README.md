@@ -27,7 +27,11 @@ With Nix (recommended, no host pollution):
 
     nix develop --command go build .
 
-With system Go:
+With Docker (works anywhere `docker compose` does, pins the Go toolchain):
+
+    docker compose run --rm build
+
+With system Go (needs 1.21+ so the `toolchain` directive can fetch 1.26):
 
     go build .
 
