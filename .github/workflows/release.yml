@@ -38,7 +38,18 @@ jobs:
 
       - name: Smoke check
         run: |
-          ./agentpen-linux-amd64 --version
+          VERSION="${GITHUB_REF_NAME#v}"
+          COMMIT="${GITHUB_SHA::7}"
+          OUT="$(./agentpen-linux-amd64 --version)"
+          echo "$OUT"
+          case "$OUT" in
+            *"$VERSION"*) ;;
+            *) echo "expected --version output to contain $VERSION" >&2; exit 1 ;;
+          esac
+          case "$OUT" in
+            *"$COMMIT"*) ;;
+            *) echo "expected --version output to contain $COMMIT" >&2; exit 1 ;;
+          esac
           # --check exits 0 even when capabilities are missing; we just want the build
           # to have linked and the flag plumbing to fire.
           ./agentpen-linux-amd64 --check > /dev/null
