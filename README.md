@@ -29,9 +29,11 @@ With Nix (recommended, no host pollution):
 
 With Docker (works anywhere `docker compose` does, pins the Go toolchain):
 
-    docker compose run --rm build
+    UID=$(id -u) GID=$(id -g) docker compose run --rm build
 
-With system Go (needs 1.21+ so the `toolchain` directive can fetch 1.26):
+(The explicit `UID`/`GID` ensure the output binary is owned by you. Bash doesn't export them by default, so `compose.yml`'s `${UID:-1000}` substitution would otherwise silently fall back to `1000:1000`.)
+
+With system Go 1.21 or newer (the `go 1.26.1` directive in `go.mod` auto-downloads the matching toolchain on first build):
 
     go build .
 
