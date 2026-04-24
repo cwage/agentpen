@@ -4,7 +4,7 @@ Confinement wrapper for LLM coding agents (Claude Code, Codex, Aider, OpenCode) 
 
 ## Status
 
-MVP, Linux only. Single profile shipping (`untrusted`, default). `paranoid` stubbed. Auto-detects NixOS vs FHS layouts, so the same binary works on NixOS and Ubuntu/Debian/etc.
+MVP, Linux **x86_64 only** (the seccomp BPF filter is currently amd64-specific; arm64 is [tracked as a follow-up](https://github.com/cwage/agentpen/issues/10)). Single profile shipping (`untrusted`, default); `paranoid` stubbed. Auto-detects NixOS vs FHS layouts, so the same binary works on NixOS and Ubuntu/Debian/etc.
 
 ## What the untrusted profile blocks
 
@@ -51,3 +51,7 @@ Known agents auto-detected from the command's basename: `claude`, `codex`, `aide
 ## Design notes
 
 See [`notes.md`](./notes.md) for the threat model, design decisions, and deferred work.
+
+## License
+
+MIT. See [`LICENSE`](./LICENSE).

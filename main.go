@@ -12,6 +12,14 @@ import (
 	"syscall"
 )
 
+// Populated at build time via -ldflags "-X main.version=... -X main.commit=... -X main.date=...".
+// Defaults identify unreleased local builds.
+var (
+	version = "dev"
+	commit  = "none"
+	date    = "unknown"
+)
+
 type stringList []string
 
 func (s *stringList) String() string     { return strings.Join(*s, ",") }
@@ -52,6 +60,7 @@ options:
   --project DIR    project dir, bound RW (default: $PWD)
   --check          report which sandbox layers this host can enforce and exit
   --reap           tear down leaked ap-* netns from crashed/killed prior runs
+  --version        print version and exit
   -h, --help       show this help
 
 known agents: %s
@@ -76,6 +85,7 @@ func run() error {
 		mountRW    stringList
 		check      bool
 		reap       bool
+		showVer    bool
 	)
 
 	fs := flag.NewFlagSet("agentpen", flag.ContinueOnError)
@@ -89,6 +99,7 @@ func run() error {
 	fs.Var(&mountRW, "mount-rw", "")
 	fs.BoolVar(&check, "check", false, "")
 	fs.BoolVar(&reap, "reap", false, "")
+	fs.BoolVar(&showVer, "version", false, "")
 
 	if err := fs.Parse(os.Args[1:]); err != nil {
 		if err == flag.ErrHelp {
@@ -97,8 +108,14 @@ func run() error {
 		return err
 	}
 
+	if showVer {
+		fmt.Printf("agentpen %s (commit %s, built %s)\n", version, commit, date)
+		return nil
+	}
+
 	// --check: report capabilities and exit without running anything
 	if check {
+		fmt.Printf("agentpen %s\n\n", version)
 		fmt.Print(detectCapabilities().Report(profile))
 		return nil
 	}

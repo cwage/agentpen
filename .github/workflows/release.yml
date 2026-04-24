@@ -1,0 +1,67 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Vet and test
+        run: |
+          go vet ./...
+          go test ./...
+
+      - name: Build
+        env:
+          CGO_ENABLED: 0
+          GOOS: linux
+          GOARCH: amd64
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          COMMIT="${GITHUB_SHA::7}"
+          DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          go build -trimpath \
+            -ldflags "-s -w -X main.version=$VERSION -X main.commit=$COMMIT -X main.date=$DATE" \
+            -o agentpen-linux-amd64 .
+
+      - name: Smoke check
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          COMMIT="${GITHUB_SHA::7}"
+          OUT="$(./agentpen-linux-amd64 --version)"
+          echo "$OUT"
+          case "$OUT" in
+            *"$VERSION"*) ;;
+            *) echo "expected --version output to contain $VERSION" >&2; exit 1 ;;
+          esac
+          case "$OUT" in
+            *"$COMMIT"*) ;;
+            *) echo "expected --version output to contain $COMMIT" >&2; exit 1 ;;
+          esac
+          # --check exits 0 even when capabilities are missing; we just want the build
+          # to have linked and the flag plumbing to fire.
+          ./agentpen-linux-amd64 --check > /dev/null
+
+      - name: Checksum
+        run: sha256sum agentpen-linux-amd64 > agentpen-linux-amd64.sha256
+
+      - name: Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes \
+            agentpen-linux-amd64 agentpen-linux-amd64.sha256
