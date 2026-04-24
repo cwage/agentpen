@@ -162,10 +162,14 @@ func parseOrphanCandidates(listing string) []int {
 	return pids
 }
 
-// isAgentpenAlive returns true iff /proc/<pid>/comm reads as "agentpen".
-// Returning true on ambiguous errors (hidepid, transient I/O) is the
-// fail-safe choice — better to leak a namespace than wrongly tear down a
-// live session. Only treats os.ErrNotExist as definitively dead.
+// isAgentpenAlive returns true iff /proc/<pid>/comm begins with "agentpen".
+// Prefix match (not equality) so renamed/symlinked builds like agentpen-dev
+// don't look "dead" to a concurrent session and get reaped. Kernel truncates
+// comm to 15 chars so "agentpen" always fits at the start.
+//
+// Returning true on ambiguous errors (hidepid, transient I/O) is the fail-safe
+// choice — better to leak a namespace than wrongly tear down a live session.
+// Only treats os.ErrNotExist as definitively dead.
 func isAgentpenAlive(pid int) bool {
 	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/comm", pid))
 	if errors.Is(err, os.ErrNotExist) {
@@ -174,7 +178,7 @@ func isAgentpenAlive(pid int) bool {
 	if err != nil {
 		return true
 	}
-	return strings.TrimSpace(string(data)) == "agentpen"
+	return strings.HasPrefix(strings.TrimSpace(string(data)), "agentpen")
 }
 
 // reapOrphans walks `ip netns list`, finds any `ap-<pid>` namespaces whose
@@ -189,8 +193,11 @@ func isAgentpenAlive(pid int) bool {
 // namespaces whose teardown fully succeeded; per-namespace failures are
 // logged to stderr so partial reap is visible.
 func reapOrphans() ([]string, error) {
-	out, err := exec.Command("sudo", "-n", "ip", "netns", "list").Output()
+	out, err := exec.Command("sudo", "-n", "ip", "netns", "list").CombinedOutput()
 	if err != nil {
+		if msg := strings.TrimSpace(string(out)); msg != "" {
+			return nil, fmt.Errorf("list netns: %w: %s", err, msg)
+		}
 		return nil, fmt.Errorf("list netns: %w", err)
 	}
 	var reaped []string
