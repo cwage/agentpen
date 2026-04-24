@@ -67,8 +67,9 @@ func TestResolveCommand_SymlinkToUserLocal(t *testing.T) {
 
 func TestResolveCommand_SystemBinary(t *testing.T) {
 	// A binary under a covered layout dir should produce zero auto-mounts.
-	layout := HostLayout{ReadOnlyBinds: []string{"/usr", "/bin"}}
-	// Use /bin/sh; present on every Linux box CI would run on.
+	// Use the detected host layout so this passes on both FHS (/bin/sh is a
+	// real file under /bin or /usr/bin) and NixOS (/bin/sh → /nix/store/...).
+	layout := detectHostLayout()
 	got, mounts, err := resolveCommand([]string{"sh"}, layout)
 	if err != nil {
 		t.Skipf("sh not on PATH in this env: %v", err)
