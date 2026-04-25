@@ -9,7 +9,7 @@ import (
 
 // Capability is one atomic capability the host either does or doesn't provide.
 // Multiple capabilities combine into layers (e.g. network isolation needs
-// ip + nft + iptables + sudo + runuser).
+// pasta + bwrap + setpriv).
 type Capability struct {
 	Name        string
 	Description string
@@ -32,11 +32,8 @@ func detectCapabilities() Capabilities {
 		check      func() (bool, string)
 	}{
 		{"bwrap", "Filesystem & process isolation (bubblewrap)", func() (bool, string) { return bin("bwrap") }},
-		{"ip", "Network namespace management (iproute2)", func() (bool, string) { return bin("ip") }},
-		{"nft", "Egress filtering (nftables)", func() (bool, string) { return bin("nft") }},
-		{"iptables", "Host-side NAT for sandbox subnet", func() (bool, string) { return bin("iptables") }},
-		{"sudo", "Privilege escalation for netns setup", func() (bool, string) { return bin("sudo") }},
-		{"runuser", "Drop privileges back to user inside netns", func() (bool, string) { return bin("runuser") }},
+		{"pasta", "Userspace network namespace (passt/pasta)", func() (bool, string) { return bin("pasta") }},
+		{"ip", "Configure addresses and routes inside the namespace (iproute2)", func() (bool, string) { return bin("ip") }},
 		{"seccomp", "Syscall restriction via BPF", func() (bool, string) {
 			if runtime.GOARCH != "amd64" {
 				return false, "seccomp filter currently only generated for amd64"
@@ -59,8 +56,7 @@ func requiredFor(profile string) map[string]bool {
 	switch profile {
 	case "untrusted":
 		return map[string]bool{
-			"bwrap": true, "ip": true, "nft": true, "iptables": true,
-			"sudo": true, "runuser": true, "seccomp": true,
+			"bwrap": true, "pasta": true, "ip": true, "seccomp": true,
 		}
 	}
 	return nil

@@ -9,15 +9,19 @@ MVP, Linux **x86_64 only** (the seccomp BPF filter is currently amd64-specific; 
 ## What the untrusted profile blocks
 
 - **Filesystem**: `$HOME` becomes a fresh tmpfs; only the project directory is writable; credentials (`~/.ssh`, `~/.aws`, `~/.gnupg`) and sibling repos are invisible.
-- **Network**: netns + nftables allowlist — only the agent's API endpoints reachable; DNS pinned to `/etc/hosts`; everything else drops.
+- **Network**: pasta-managed userns + a /32 route to the gateway → no default route, no kernel-level reachability outside the proxy. The agent's `/etc/hosts` maps allowed hostnames to an in-namespace forwarder, which splices to an SNI-sniffing TCP proxy on host loopback that gates outbound by hostname (no TLS termination, no MITM). Direct-IP egress is rejected by the kernel.
 - **Env**: scrubbed, with per-agent passthrough only (no `SSH_AUTH_SOCK`, no arbitrary host env).
 - **Seccomp** (amd64): BPF filter blocking `ptrace`, `keyctl` family, `mount`/`pivot_root`, `bpf`, kernel module syscalls, `reboot`/`kexec`, and other kernel-touching vectors.
+
+Rootless: no `sudo`, no `setcap`, no sysctl tweaks, no persistent host state. The whole sandbox tears down with the process.
+
+Known limitation: a misbehaving agent can SIGKILL the in-namespace forwarder and lose its own outbound until the next `agentpen` invocation. Self-DoS, no privilege escalation — see `notes.md`.
 
 Not defended against: steganographic exfil inside prompt bodies (a fundamental limit); a malicious agent binary stealing the API credential still in-sandbox (phase 2 work, see `notes.md`).
 
 ## Requirements
 
-Runtime: `bubblewrap`, `nftables`, `iproute2`, `iptables`, `sudo`, `runuser`, and a Linux kernel with user namespaces enabled.
+Runtime: `bubblewrap`, `passt` (provides `pasta`), `iproute2`, and a Linux kernel with user namespaces enabled.
 
 Run `agentpen --check` to report which layers this host can actually enforce.
 

@@ -4,12 +4,9 @@ import (
 	"flag"
 	"fmt"
 	"os"
-	"os/exec"
-	"os/signal"
 	"path/filepath"
 	"sort"
 	"strings"
-	"syscall"
 )
 
 // Populated at build time via -ldflags "-X main.version=... -X main.commit=... -X main.date=...".
@@ -46,9 +43,10 @@ func usage() {
 	sort.Strings(known)
 	fmt.Fprintf(os.Stderr, `usage: agentpen [options] [--] <command> [args...]
        agentpen --check
-       agentpen --reap
 
-Runs <command> inside a confined sandbox (bwrap + netns + nftables + seccomp).
+Runs <command> inside a confined sandbox (pasta + bwrap + seccomp) with an
+SNI-gated network egress proxy on host loopback. No sudo, no setcap, no
+persistent host state.
 
 options:
   --profile P      profile: untrusted (default), paranoid (not yet implemented)
@@ -59,7 +57,6 @@ options:
   --mount-rw PATH  extra read-write bind mount (repeatable)
   --project DIR    project dir, bound RW (default: $PWD)
   --check          report which sandbox layers this host can enforce and exit
-  --reap           tear down leaked ap-* netns from crashed/killed prior runs
   --version        print version and exit
   -h, --help       show this help
 
@@ -68,6 +65,26 @@ known agents: %s
 }
 
 func main() {
+	// Internal subcommands run when agentpen re-execs itself inside pasta's
+	// userns. Dispatched before flag parsing so the inner argv shape can be
+	// independent of the user-facing CLI.
+	if len(os.Args) >= 2 {
+		switch os.Args[1] {
+		case "__sandbox-init":
+			if err := runSandboxInit(os.Args[2:]); err != nil {
+				fmt.Fprintln(os.Stderr, "agentpen __sandbox-init:", err)
+				os.Exit(1)
+			}
+			return
+		case "__forwarder":
+			if err := runForwarder(os.Args[2:]); err != nil {
+				fmt.Fprintln(os.Stderr, "agentpen __forwarder:", err)
+				os.Exit(1)
+			}
+			return
+		}
+	}
+
 	if err := run(); err != nil {
 		fmt.Fprintln(os.Stderr, "agentpen:", err)
 		os.Exit(1)
@@ -84,7 +101,6 @@ func run() error {
 		mountRO    stringList
 		mountRW    stringList
 		check      bool
-		reap       bool
 		showVer    bool
 	)
 
@@ -98,7 +114,6 @@ func run() error {
 	fs.Var(&mountRO, "mount", "")
 	fs.Var(&mountRW, "mount-rw", "")
 	fs.BoolVar(&check, "check", false, "")
-	fs.BoolVar(&reap, "reap", false, "")
 	fs.BoolVar(&showVer, "version", false, "")
 
 	if err := fs.Parse(os.Args[1:]); err != nil {
@@ -113,27 +128,9 @@ func run() error {
 		return nil
 	}
 
-	// --check: report capabilities and exit without running anything
 	if check {
 		fmt.Printf("agentpen %s\n\n", version)
 		fmt.Print(detectCapabilities().Report(profile))
-		return nil
-	}
-
-	// --reap: tear down leaked namespaces from prior crashed/killed runs
-	if reap {
-		if err := sudoRun("-v"); err != nil {
-			return fmt.Errorf("sudo: %w", err)
-		}
-		reaped, err := reapOrphans()
-		if err != nil {
-			return err
-		}
-		if len(reaped) == 0 {
-			fmt.Println("no orphaned agentpen namespaces found")
-		} else {
-			fmt.Printf("reaped %d orphan(s): %s\n", len(reaped), strings.Join(reaped, " "))
-		}
 		return nil
 	}
 
@@ -151,7 +148,6 @@ func run() error {
 		return fmt.Errorf("unknown profile: %s", profile)
 	}
 
-	// Validate capabilities up front (fail-closed).
 	caps := detectCapabilities()
 	if err := caps.ValidateFor(profile); err != nil {
 		return fmt.Errorf("%w\nrun 'agentpen --check' for details", err)
@@ -205,7 +201,6 @@ func run() error {
 		return err
 	}
 
-	// Merge registry + user-supplied
 	cfg := runConfig{
 		Profile:       profile,
 		Agent:         agent,
@@ -227,88 +222,48 @@ func run() error {
 	cfg.AllowedHosts = dedupe(append(cfg.AllowedHosts, allow...))
 	cfg.EnvVars = dedupe(append(cfg.EnvVars, env...))
 
-	// Resolve hosts
-	allowedIPs, err := resolveHosts(cfg.AllowedHosts)
-	if err != nil {
-		return err
-	}
-	if len(cfg.AllowedHosts) > 0 && len(allowedIPs) == 0 {
-		return fmt.Errorf("couldn't resolve any allowed hosts")
-	}
-
-	// Acquire sudo upfront so we don't prompt mid-setup
-	if err := sudoRun("-v"); err != nil {
-		return fmt.Errorf("sudo: %w", err)
-	}
-
-	// Auto-reap orphans from crashed/killed prior runs. Surface listing errors
-	// as warnings but proceed — a failed reap shouldn't block a new run.
-	if reaped, err := reapOrphans(); err != nil {
-		fmt.Fprintf(os.Stderr, "agentpen: auto-reap skipped: %v\n", err)
-	} else if len(reaped) > 0 {
-		fmt.Fprintf(os.Stderr, "agentpen: reaped %d leaked namespace(s): %s\n",
-			len(reaped), strings.Join(reaped, " "))
-	}
-
-	// Netns setup
-	ns := newNetns(os.Getpid())
-	cleanup := func() {
-		_ = ns.teardown()
-	}
-	defer cleanup()
-	// Also clean on signal
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-	go func() {
-		<-sigCh
-		cleanup()
-		os.Exit(130)
-	}()
-
-	if err := ns.setup(allowedIPs); err != nil {
-		return err
-	}
-
-	// Stage /etc
-	etcDir, err := stageEtc(cfg.AllowedHosts, firstIPFor(cfg.AllowedHosts))
+	// Stage /etc: each allowed hostname → 127.0.0.1 (the in-namespace forwarder).
+	etcDir, err := stageEtc(cfg.AllowedHosts)
 	if err != nil {
 		return fmt.Errorf("stage /etc: %w", err)
 	}
 	defer os.RemoveAll(etcDir)
 
-	// Build bwrap argv
-	args := bwrapArgs(cfg, etcDir)
+	// Build bwrap argv. Seccomp filter goes via FD 3 — we wrap the final exec
+	// in a bash snippet inside __sandbox-init that reopens the file as FD 3
+	// before exec'ing bwrap. (Same pattern as before, sans the sudo+runuser layer.)
+	bwrapArgv := bwrapArgs(cfg, etcDir)
 
-	// Write seccomp filter to a tempfile; pass via FD 3 to bwrap.
-	// sudo drops inherited FDs, so we wrap the final exec in a bash snippet
-	// that reopens the file as FD 3 inside the sudo-launched shell.
 	filterPath, err := writeSeccompFilter()
 	if err != nil {
 		return fmt.Errorf("seccomp filter: %w", err)
 	}
 	defer os.Remove(filterPath)
 
-	// Prepend --seccomp 3 to the bwrap args (before the command to run)
-	args = append([]string{"--seccomp", "3"}, args...)
+	// Prepend --seccomp 3 to the bwrap args.
+	bwrapArgv = append([]string{"--seccomp", "3"}, bwrapArgv...)
 
-	// bash -c '... exec bwrap ARGS 3<FILTER_PATH' FILTER_PATH ARGS...
+	// Rewrite to: bash -c 'exec bwrap "$@" 3<"$0"' FILTER_PATH BWRAP_ARGS...
+	// __sandbox-init exec's this bash snippet which opens FD 3 and finally exec's bwrap.
 	bashSnippet := `exec bwrap "$@" 3<"$0"`
-	fullArgs := append([]string{
-		"ip", "netns", "exec", ns.Name,
-		"runuser", "-u", user, "--",
-		"bash", "-c", bashSnippet, filterPath,
-	}, args...)
+	wrappedBwrap := append([]string{"bash", "-c", bashSnippet, filterPath}, bwrapArgv...)
 
-	cmd := exec.Command("sudo", fullArgs...)
-	cmd.Stdin = os.Stdin
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	if err := cmd.Run(); err != nil {
-		// Preserve exit code from the inner command when possible
-		if exit, ok := err.(*exec.ExitError); ok {
-			os.Exit(exit.ExitCode())
-		}
+	// Start SNI proxy on host loopback.
+	proxy, err := startSNIProxy(cfg.AllowedHosts, func(format string, a ...any) {
+		fmt.Fprintf(os.Stderr, format+"\n", a...)
+	})
+	if err != nil {
 		return err
+	}
+	defer proxy.Close()
+
+	// Launch pasta -> __sandbox-init -> bash -> bwrap -> user command.
+	code, err := runPasta(proxy.Port(), wrappedBwrap)
+	if err != nil {
+		return err
+	}
+	if code != 0 {
+		os.Exit(code)
 	}
 	return nil
 }
