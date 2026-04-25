@@ -16,6 +16,12 @@ import (
 //   namespace reach the host's loopback (where the SNI proxy listens).
 // --no-dhcp / --no-ndp / --no-dhcpv6 / --no-ra: suppress all auto-config;
 //   we set everything by hand inside the namespace for determinism.
+// -t/-u/-T/-U none: disable pasta's auto port-forwarding. Defaults are
+//   `auto`, which scans /proc/net/{tcp,tcp6,udp,udp6} for bound ports —
+//   that scan logs `lseek() failed on /proc/net file: Illegal seek` once
+//   per probe on older kernels (e.g. Ubuntu 22.04). We don't want any
+//   forwarding anyway: the in-namespace forwarder + nft handle inbound,
+//   and nothing in the namespace should be reachable from the host.
 // -q: don't print pasta's startup banner on every run.
 // -f: foreground; pasta exits when its child does, which we want for clean
 //   teardown of the namespace and the in-namespace forwarder.
@@ -23,6 +29,7 @@ func pastaArgs(proxyPort int, selfPath string, bwrapArgv []string) []string {
 	args := []string{
 		"-q", "-f",
 		"--no-dhcp", "--no-dhcpv6", "--no-ndp", "--no-ra",
+		"-t", "none", "-u", "none", "-T", "none", "-U", "none",
 		// Don't pin the namespace interface name — pasta names the tap after
 		// the host's outbound interface (eno1, enp3s0, wlan0, eth0, …) and
 		// we discover whatever it picked from inside the namespace at runtime.
