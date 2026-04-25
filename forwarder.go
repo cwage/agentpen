@@ -3,7 +3,6 @@ package main
 import (
 	"fmt"
 	"net"
-	"os"
 	"time"
 )
 
@@ -37,7 +36,6 @@ func runForwarder(args []string) error {
 	if err != nil {
 		return fmt.Errorf("forwarder listen %s: %w", listenAddr, err)
 	}
-	fmt.Fprintf(os.Stderr, "agentpen forwarder: %s -> %s\n", listenAddr, upstreamAddr)
 	for {
 		c, err := ln.Accept()
 		if err != nil {

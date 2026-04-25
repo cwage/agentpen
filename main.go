@@ -67,6 +67,7 @@ options:
   --mount-rw PATH  extra read-write bind mount (repeatable)
   --project DIR    project dir, bound RW (default: $PWD)
   --check          report which sandbox layers this host can enforce and exit
+  -v, --verbose    log per-connection ALLOW/BLOCK lines from the SNI proxy
   --version        print version and exit
   -h, --help       show this help
 
@@ -118,6 +119,7 @@ func run() error {
 		mountRW    stringList
 		check      bool
 		showVer    bool
+		verbose    bool
 	)
 
 	fs := flag.NewFlagSet("agentpen", flag.ContinueOnError)
@@ -131,6 +133,8 @@ func run() error {
 	fs.Var(&mountRW, "mount-rw", "")
 	fs.BoolVar(&check, "check", false, "")
 	fs.BoolVar(&showVer, "version", false, "")
+	fs.BoolVar(&verbose, "verbose", false, "")
+	fs.BoolVar(&verbose, "v", false, "")
 
 	if err := fs.Parse(os.Args[1:]); err != nil {
 		if err == flag.ErrHelp {
@@ -270,10 +274,16 @@ func run() error {
 	shSnippet := `exec bwrap "$@" 3<"$0"`
 	wrappedBwrap := append([]string{"sh", "-c", shSnippet, filterPath}, bwrapArgv...)
 
-	// Start SNI proxy on host loopback.
-	proxy, err := startSNIProxy(cfg.AllowedHosts, func(format string, a ...any) {
-		fmt.Fprintf(os.Stderr, format+"\n", a...)
-	})
+	// Start SNI proxy on host loopback. By default the proxy is silent so it
+	// doesn't garble interactive TUIs (claude code, codex, etc.); --verbose
+	// turns the per-connection ALLOW/BLOCK/error lines back on for debugging.
+	var logf func(string, ...any)
+	if verbose {
+		logf = func(format string, a ...any) {
+			fmt.Fprintf(os.Stderr, format+"\n", a...)
+		}
+	}
+	proxy, err := startSNIProxy(cfg.AllowedHosts, logf)
 	if err != nil {
 		return err
 	}
