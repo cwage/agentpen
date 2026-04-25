@@ -16,17 +16,19 @@ import (
 // the namespace because we run pasta with --no-dhcp (DHCP would require an
 // extra client process inside; it's cleaner to configure statically).
 const (
-	sandboxGatewayIP = "192.0.2.1" // RFC 5737 documentation prefix
-	sandboxOwnIP     = "192.0.2.2"
-	sandboxNetCIDR   = "192.0.2.0/29"
-	sandboxNetIface  = "eth0"
-	forwarderListen  = "127.0.0.1:443"
+	sandboxGatewayIP   = "192.0.2.1" // RFC 5737 documentation prefix
+	sandboxOwnIP       = "192.0.2.2"
+	sandboxNetMaskBits = 29
+	sandboxNetIface    = "eth0"
+	forwarderListen    = "127.0.0.1:443"
 )
 
 // runSandboxInit runs inside pasta's userns+netns. It:
-//   1. brings up eth0 with our pinned address and a /32 route to the gateway,
-//   2. starts the forwarder as a separate process under a different uid so
-//      cap-dropped user code can't signal it,
+//   1. brings up lo and eth0 with our pinned address and a /32 route to the gateway,
+//   2. starts the forwarder as a separate process. The forwarder runs at the
+//      same kernel-side uid as the user's code (pasta's userns maps only one
+//      uid), which means user code can SIGKILL it — accepted self-DoS, not
+//      a privilege boundary violation. See spawnForwarder.
 //   3. exec's the supplied inner command (typically a bash wrapper that opens
 //      the seccomp BPF as FD 3 and exec's bwrap).
 //
@@ -34,7 +36,7 @@ const (
 //   agentpen __sandbox-init <proxy-port> -- <prog> [<args>...]
 //
 // We hold all caps here (userns-root in pasta's userns), so ip(8) calls and
-// the setuid swap in the forwarder spawn need no extra privilege.
+// the forwarder spawn need no extra privilege.
 func runSandboxInit(args []string) error {
 	if len(args) < 1 {
 		return fmt.Errorf("usage: agentpen __sandbox-init <proxy-port> -- <prog> [args...]")
@@ -72,6 +74,9 @@ func runSandboxInit(args []string) error {
 
 func configureNetns() error {
 	steps := [][]string{
+		// lo is down by default in a fresh netns. The forwarder binds 127.0.0.1
+		// and user code dials 127.0.0.1; both fail without this.
+		{"ip", "link", "set", "lo", "up"},
 		{"ip", "link", "set", sandboxNetIface, "up"},
 		{"ip", "addr", "add", sandboxOwnIP + "/32", "dev", sandboxNetIface},
 		{"ip", "route", "add", sandboxGatewayIP, "dev", sandboxNetIface},

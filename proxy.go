@@ -8,8 +8,18 @@ import (
 	"io"
 	"net"
 	"strings"
+	"sync"
 	"time"
 )
+
+// TLS spec: TLSPlaintext.length is uint16 but bounded to 2^14. Going wider
+// would require non-conformant ClientHellos.
+const maxTLSRecordLen = 16384
+
+// Max wall-clock lifetime for a single proxied connection. Bounds host-side
+// resource exposure if a sandbox holds connections open without doing I/O.
+// Real API calls — including long streaming responses — finish well below this.
+const proxyConnMaxLifetime = 1 * time.Hour
 
 // sniProxy listens on host loopback. For each TCP connection it peeks the
 // TLS ClientHello, extracts the SNI server_name, checks it against an
@@ -60,7 +70,9 @@ func (p *sniProxy) handle(client net.Conn) {
 	defer client.Close()
 	_ = client.SetDeadline(time.Now().Add(10 * time.Second))
 
-	br := bufio.NewReaderSize(client, 16384)
+	// 5-byte record header + max record body (16384). Without the +5 a
+	// max-sized ClientHello would trip ErrBufferFull in peekSNI's Peek(5+recLen).
+	br := bufio.NewReaderSize(client, 5+maxTLSRecordLen)
 	sni, err := peekSNI(br)
 	if err != nil {
 		p.logf("sni proxy: %s: peek SNI: %v", client.RemoteAddr(), err)
@@ -79,13 +91,42 @@ func (p *sniProxy) handle(client net.Conn) {
 	}
 	defer upstream.Close()
 
-	_ = client.SetDeadline(time.Time{})
-	_ = upstream.SetDeadline(time.Time{})
+	// Replace the handshake deadline with a bounded total lifetime so an
+	// idle-but-open connection can't tie up host resources indefinitely.
+	deadline := time.Now().Add(proxyConnMaxLifetime)
+	_ = client.SetDeadline(deadline)
+	_ = upstream.SetDeadline(deadline)
 
-	done := make(chan struct{}, 2)
-	go func() { _, _ = io.Copy(upstream, br); done <- struct{}{} }()
-	go func() { _, _ = io.Copy(client, upstream); done <- struct{}{} }()
-	<-done
+	spliceConns(br, client, upstream)
+}
+
+// spliceConns shovels bytes both ways between client and upstream. When one
+// direction EOFs we half-close the corresponding write side (CloseWrite) so
+// the other direction can still drain any in-flight bytes — important for
+// long-lived flows and graceful TLS shutdown. Returns when both directions
+// finish.
+func spliceConns(clientReader io.Reader, client, upstream net.Conn) {
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		_, _ = io.Copy(upstream, clientReader)
+		closeWrite(upstream)
+	}()
+	go func() {
+		defer wg.Done()
+		_, _ = io.Copy(client, upstream)
+		closeWrite(client)
+	}()
+	wg.Wait()
+}
+
+// closeWrite half-closes the write side of a TCP connection if possible.
+// Best-effort: any non-TCP conn or already-closed conn just no-ops.
+func closeWrite(c net.Conn) {
+	if tc, ok := c.(*net.TCPConn); ok {
+		_ = tc.CloseWrite()
+	}
 }
 
 // peekSNI parses just enough of a TLS ClientHello (RFC 8446 §4 / RFC 5246 §7.4)
@@ -100,7 +141,7 @@ func peekSNI(br *bufio.Reader) (string, error) {
 		return "", fmt.Errorf("not a TLS handshake record (got 0x%02x)", hdr[0])
 	}
 	recLen := int(binary.BigEndian.Uint16(hdr[3:5]))
-	if recLen < 42 || recLen > 16384 {
+	if recLen < 42 || recLen > maxTLSRecordLen {
 		return "", fmt.Errorf("implausible record length %d", recLen)
 	}
 	full, err := br.Peek(5 + recLen)

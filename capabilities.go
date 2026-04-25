@@ -9,7 +9,7 @@ import (
 
 // Capability is one atomic capability the host either does or doesn't provide.
 // Multiple capabilities combine into layers (e.g. network isolation needs
-// pasta + bwrap + setpriv).
+// pasta + ip; sandbox isolation needs bwrap; syscall filtering needs seccomp).
 type Capability struct {
 	Name        string
 	Description string

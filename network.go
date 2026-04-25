@@ -22,7 +22,7 @@ func pastaArgs(proxyPort int, selfPath string, bwrapArgv []string) []string {
 	args := []string{
 		"-q", "-f",
 		"--no-dhcp", "--no-dhcpv6", "--no-ndp", "--no-ra",
-		"-a", sandboxOwnIP, "-n", "29", "-g", sandboxGatewayIP,
+		"-a", sandboxOwnIP, "-n", fmt.Sprintf("%d", sandboxNetMaskBits), "-g", sandboxGatewayIP,
 		"--map-host-loopback", sandboxGatewayIP,
 		"--",
 		selfPath, "__sandbox-init", fmt.Sprintf("%d", proxyPort), "--",

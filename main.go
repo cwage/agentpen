@@ -1,13 +1,22 @@
 package main
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
+	"unicode"
 )
+
+// exitError lets run() propagate a non-zero child exit code without bypassing
+// the deferred cleanups (temp dir removal, proxy.Close, etc.) that os.Exit
+// would skip. main() unwraps it after run() returns.
+type exitError struct{ code int }
+
+func (e *exitError) Error() string { return fmt.Sprintf("inner command exited with code %d", e.code) }
 
 // Populated at build time via -ldflags "-X main.version=... -X main.commit=... -X main.date=...".
 // Defaults identify unreleased local builds.
@@ -85,10 +94,16 @@ func main() {
 		}
 	}
 
-	if err := run(); err != nil {
-		fmt.Fprintln(os.Stderr, "agentpen:", err)
-		os.Exit(1)
+	err := run()
+	if err == nil {
+		return
 	}
+	var ee *exitError
+	if errors.As(err, &ee) {
+		os.Exit(ee.code)
+	}
+	fmt.Fprintln(os.Stderr, "agentpen:", err)
+	os.Exit(1)
 }
 
 func run() error {
@@ -219,7 +234,10 @@ func run() error {
 		cfg.EnvVars = append(cfg.EnvVars, a.EnvVars...)
 		cfg.Mounts = append(cfg.Mounts, a.Mounts...)
 	}
-	cfg.AllowedHosts = dedupe(append(cfg.AllowedHosts, allow...))
+	cfg.AllowedHosts, err = normalizeHosts(append(cfg.AllowedHosts, allow...))
+	if err != nil {
+		return err
+	}
 	cfg.EnvVars = dedupe(append(cfg.EnvVars, env...))
 
 	// Stage /etc: each allowed hostname → 127.0.0.1 (the in-namespace forwarder).
@@ -230,8 +248,10 @@ func run() error {
 	defer os.RemoveAll(etcDir)
 
 	// Build bwrap argv. Seccomp filter goes via FD 3 — we wrap the final exec
-	// in a bash snippet inside __sandbox-init that reopens the file as FD 3
-	// before exec'ing bwrap. (Same pattern as before, sans the sudo+runuser layer.)
+	// in a bash snippet that reopens the BPF file as FD 3 before exec'ing
+	// bwrap, since Go's syscall.Exec from __sandbox-init doesn't let us inject
+	// FDs as cleanly. The bash hop is the same trick the old sudo-based path
+	// used; the privileged scaffolding around it is what's gone.
 	bwrapArgv := bwrapArgs(cfg, etcDir)
 
 	filterPath, err := writeSeccompFilter()
@@ -263,9 +283,36 @@ func run() error {
 		return err
 	}
 	if code != 0 {
-		os.Exit(code)
+		return &exitError{code: code}
 	}
 	return nil
+}
+
+// normalizeHosts trims, lowercases, and dedupes hostnames, rejecting any that
+// contain whitespace or control characters. /etc/hosts is whitespace-delimited,
+// so a value like "a.com b.com" would silently produce two aliases on one
+// line; the SNI-allowlist comparison would also miss the second name. Failing
+// fast with a clear error keeps both consumers honest.
+func normalizeHosts(in []string) ([]string, error) {
+	seen := map[string]bool{}
+	out := make([]string, 0, len(in))
+	for _, raw := range in {
+		h := strings.ToLower(strings.TrimSpace(raw))
+		if h == "" {
+			continue
+		}
+		for _, r := range h {
+			if unicode.IsSpace(r) || unicode.IsControl(r) {
+				return nil, fmt.Errorf("invalid hostname %q: contains whitespace or control character", raw)
+			}
+		}
+		if seen[h] {
+			continue
+		}
+		seen[h] = true
+		out = append(out, h)
+	}
+	return out, nil
 }
 
 func dedupe(in []string) []string {

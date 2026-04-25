@@ -2,7 +2,6 @@ package main
 
 import (
 	"fmt"
-	"io"
 	"net"
 	"os"
 )
@@ -42,8 +41,7 @@ func forwardOne(client net.Conn, upstreamAddr string) {
 		return
 	}
 	defer upstream.Close()
-	done := make(chan struct{}, 2)
-	go func() { _, _ = io.Copy(upstream, client); done <- struct{}{} }()
-	go func() { _, _ = io.Copy(client, upstream); done <- struct{}{} }()
-	<-done
+	// Same half-close pattern as the SNI proxy — shovel both ways, CloseWrite
+	// when one direction EOFs so the other can drain.
+	spliceConns(client, client, upstream)
 }
