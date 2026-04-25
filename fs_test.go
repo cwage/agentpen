@@ -3,6 +3,7 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -170,6 +171,50 @@ func TestBwrapArgs_CredentialsNotLeaked(t *testing.T) {
 				}
 			}
 		}
+	}
+}
+
+func TestBwrapArgs_MapsToHostUidGid(t *testing.T) {
+	// Pasta launches us in a userns where the caller is uid 0; without
+	// --uid/--gid bwrap preserves that root identity, which trips agent
+	// self-checks (e.g. claude --dangerously-skip-permissions). bwrapArgs
+	// must pass the real host uid/gid through, and they must appear before
+	// --clearenv so they're applied to the sandboxed process.
+	_, dirs := makeExistingDirs(t, "home/alice", "project", "etc")
+	home, project, etc := dirs[0], dirs[1], dirs[2]
+
+	cfg := runConfig{
+		ProjectDir: project,
+		Home:       home,
+		User:       "alice",
+		Command:    []string{"true"},
+	}
+	args := bwrapArgs(cfg, etc)
+
+	wantUID := strconv.Itoa(os.Getuid())
+	wantGID := strconv.Itoa(os.Getgid())
+	if !hasFlagPair(args, "--uid", wantUID) {
+		t.Errorf("missing --uid %s in args", wantUID)
+	}
+	if !hasFlagPair(args, "--gid", wantGID) {
+		t.Errorf("missing --gid %s in args", wantGID)
+	}
+
+	idxOf := func(flag string) int {
+		for i, a := range args {
+			if a == flag {
+				return i
+			}
+		}
+		return -1
+	}
+	uidIdx, gidIdx, clearIdx := idxOf("--uid"), idxOf("--gid"), idxOf("--clearenv")
+	if uidIdx < 0 || gidIdx < 0 || clearIdx < 0 {
+		t.Fatalf("flags missing: uid=%d gid=%d clearenv=%d", uidIdx, gidIdx, clearIdx)
+	}
+	if uidIdx > clearIdx || gidIdx > clearIdx {
+		t.Errorf("--uid/--gid must appear before --clearenv (uid=%d gid=%d clearenv=%d)",
+			uidIdx, gidIdx, clearIdx)
 	}
 }
 
