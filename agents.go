@@ -13,7 +13,10 @@ var agents = map[string]Agent{
 		Mounts:       []string{"~/.claude", "~/.claude.json"},
 	},
 	"codex": {
-		AllowedHosts: []string{"api.openai.com"},
+		// chatgpt.com is the streaming endpoint when codex is authenticated via
+		// ChatGPT login (the default for most users); api.openai.com is the API-key
+		// path; auth.openai.com handles the OAuth flow for ChatGPT login.
+		AllowedHosts: []string{"api.openai.com", "chatgpt.com", "auth.openai.com"},
 		EnvVars:      []string{"OPENAI_API_KEY", "OPENAI_BASE_URL"},
 		Mounts:       []string{"~/.codex", "~/.config/codex"},
 	},
