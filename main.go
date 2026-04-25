@@ -1,16 +1,23 @@
 package main
 
 import (
+	"errors"
 	"flag"
 	"fmt"
+	"net"
 	"os"
-	"os/exec"
-	"os/signal"
 	"path/filepath"
 	"sort"
 	"strings"
-	"syscall"
+	"unicode"
 )
+
+// exitError lets run() propagate a non-zero child exit code without bypassing
+// the deferred cleanups (temp dir removal, proxy.Close, etc.) that os.Exit
+// would skip. main() unwraps it after run() returns.
+type exitError struct{ code int }
+
+func (e *exitError) Error() string { return fmt.Sprintf("inner command exited with code %d", e.code) }
 
 // Populated at build time via -ldflags "-X main.version=... -X main.commit=... -X main.date=...".
 // Defaults identify unreleased local builds.
@@ -46,9 +53,10 @@ func usage() {
 	sort.Strings(known)
 	fmt.Fprintf(os.Stderr, `usage: agentpen [options] [--] <command> [args...]
        agentpen --check
-       agentpen --reap
 
-Runs <command> inside a confined sandbox (bwrap + netns + nftables + seccomp).
+Runs <command> inside a confined sandbox (pasta + bwrap + nft + seccomp)
+with an SNI-gated network egress proxy on host loopback. No sudo, no
+setcap, no persistent host state.
 
 options:
   --profile P      profile: untrusted (default), paranoid (not yet implemented)
@@ -59,7 +67,7 @@ options:
   --mount-rw PATH  extra read-write bind mount (repeatable)
   --project DIR    project dir, bound RW (default: $PWD)
   --check          report which sandbox layers this host can enforce and exit
-  --reap           tear down leaked ap-* netns from crashed/killed prior runs
+  -v, --verbose    log per-connection ALLOW/BLOCK lines from the SNI proxy
   --version        print version and exit
   -h, --help       show this help
 
@@ -68,10 +76,36 @@ known agents: %s
 }
 
 func main() {
-	if err := run(); err != nil {
-		fmt.Fprintln(os.Stderr, "agentpen:", err)
-		os.Exit(1)
+	// Internal subcommands run when agentpen re-execs itself inside pasta's
+	// userns. Dispatched before flag parsing so the inner argv shape can be
+	// independent of the user-facing CLI.
+	if len(os.Args) >= 2 {
+		switch os.Args[1] {
+		case "__sandbox-init":
+			if err := runSandboxInit(os.Args[2:]); err != nil {
+				fmt.Fprintln(os.Stderr, "agentpen __sandbox-init:", err)
+				os.Exit(1)
+			}
+			return
+		case "__forwarder":
+			if err := runForwarder(os.Args[2:]); err != nil {
+				fmt.Fprintln(os.Stderr, "agentpen __forwarder:", err)
+				os.Exit(1)
+			}
+			return
+		}
 	}
+
+	err := run()
+	if err == nil {
+		return
+	}
+	var ee *exitError
+	if errors.As(err, &ee) {
+		os.Exit(ee.code)
+	}
+	fmt.Fprintln(os.Stderr, "agentpen:", err)
+	os.Exit(1)
 }
 
 func run() error {
@@ -84,8 +118,8 @@ func run() error {
 		mountRO    stringList
 		mountRW    stringList
 		check      bool
-		reap       bool
 		showVer    bool
+		verbose    bool
 	)
 
 	fs := flag.NewFlagSet("agentpen", flag.ContinueOnError)
@@ -98,8 +132,9 @@ func run() error {
 	fs.Var(&mountRO, "mount", "")
 	fs.Var(&mountRW, "mount-rw", "")
 	fs.BoolVar(&check, "check", false, "")
-	fs.BoolVar(&reap, "reap", false, "")
 	fs.BoolVar(&showVer, "version", false, "")
+	fs.BoolVar(&verbose, "verbose", false, "")
+	fs.BoolVar(&verbose, "v", false, "")
 
 	if err := fs.Parse(os.Args[1:]); err != nil {
 		if err == flag.ErrHelp {
@@ -113,27 +148,9 @@ func run() error {
 		return nil
 	}
 
-	// --check: report capabilities and exit without running anything
 	if check {
 		fmt.Printf("agentpen %s\n\n", version)
 		fmt.Print(detectCapabilities().Report(profile))
-		return nil
-	}
-
-	// --reap: tear down leaked namespaces from prior crashed/killed runs
-	if reap {
-		if err := sudoRun("-v"); err != nil {
-			return fmt.Errorf("sudo: %w", err)
-		}
-		reaped, err := reapOrphans()
-		if err != nil {
-			return err
-		}
-		if len(reaped) == 0 {
-			fmt.Println("no orphaned agentpen namespaces found")
-		} else {
-			fmt.Printf("reaped %d orphan(s): %s\n", len(reaped), strings.Join(reaped, " "))
-		}
 		return nil
 	}
 
@@ -151,7 +168,6 @@ func run() error {
 		return fmt.Errorf("unknown profile: %s", profile)
 	}
 
-	// Validate capabilities up front (fail-closed).
 	caps := detectCapabilities()
 	if err := caps.ValidateFor(profile); err != nil {
 		return fmt.Errorf("%w\nrun 'agentpen --check' for details", err)
@@ -205,7 +221,6 @@ func run() error {
 		return err
 	}
 
-	// Merge registry + user-supplied
 	cfg := runConfig{
 		Profile:       profile,
 		Agent:         agent,
@@ -224,93 +239,110 @@ func run() error {
 		cfg.EnvVars = append(cfg.EnvVars, a.EnvVars...)
 		cfg.Mounts = append(cfg.Mounts, a.Mounts...)
 	}
-	cfg.AllowedHosts = dedupe(append(cfg.AllowedHosts, allow...))
-	cfg.EnvVars = dedupe(append(cfg.EnvVars, env...))
-
-	// Resolve hosts
-	allowedIPs, err := resolveHosts(cfg.AllowedHosts)
+	cfg.AllowedHosts, err = normalizeHosts(append(cfg.AllowedHosts, allow...))
 	if err != nil {
 		return err
 	}
-	if len(cfg.AllowedHosts) > 0 && len(allowedIPs) == 0 {
-		return fmt.Errorf("couldn't resolve any allowed hosts")
-	}
+	cfg.EnvVars = dedupe(append(cfg.EnvVars, env...))
 
-	// Acquire sudo upfront so we don't prompt mid-setup
-	if err := sudoRun("-v"); err != nil {
-		return fmt.Errorf("sudo: %w", err)
-	}
-
-	// Auto-reap orphans from crashed/killed prior runs. Surface listing errors
-	// as warnings but proceed — a failed reap shouldn't block a new run.
-	if reaped, err := reapOrphans(); err != nil {
-		fmt.Fprintf(os.Stderr, "agentpen: auto-reap skipped: %v\n", err)
-	} else if len(reaped) > 0 {
-		fmt.Fprintf(os.Stderr, "agentpen: reaped %d leaked namespace(s): %s\n",
-			len(reaped), strings.Join(reaped, " "))
-	}
-
-	// Netns setup
-	ns := newNetns(os.Getpid())
-	cleanup := func() {
-		_ = ns.teardown()
-	}
-	defer cleanup()
-	// Also clean on signal
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-	go func() {
-		<-sigCh
-		cleanup()
-		os.Exit(130)
-	}()
-
-	if err := ns.setup(allowedIPs); err != nil {
-		return err
-	}
-
-	// Stage /etc
-	etcDir, err := stageEtc(cfg.AllowedHosts, firstIPFor(cfg.AllowedHosts))
+	// Stage /etc: each allowed hostname → 127.0.0.1 (the in-namespace forwarder).
+	etcDir, err := stageEtc(cfg.AllowedHosts)
 	if err != nil {
 		return fmt.Errorf("stage /etc: %w", err)
 	}
 	defer os.RemoveAll(etcDir)
 
-	// Build bwrap argv
-	args := bwrapArgs(cfg, etcDir)
+	// Build bwrap argv. Seccomp filter goes via FD 3 — we wrap the final exec
+	// in a bash snippet that reopens the BPF file as FD 3 before exec'ing
+	// bwrap, since Go's syscall.Exec from __sandbox-init doesn't let us inject
+	// FDs as cleanly. The bash hop is the same trick the old sudo-based path
+	// used; the privileged scaffolding around it is what's gone.
+	bwrapArgv := bwrapArgs(cfg, etcDir)
 
-	// Write seccomp filter to a tempfile; pass via FD 3 to bwrap.
-	// sudo drops inherited FDs, so we wrap the final exec in a bash snippet
-	// that reopens the file as FD 3 inside the sudo-launched shell.
 	filterPath, err := writeSeccompFilter()
 	if err != nil {
 		return fmt.Errorf("seccomp filter: %w", err)
 	}
 	defer os.Remove(filterPath)
 
-	// Prepend --seccomp 3 to the bwrap args (before the command to run)
-	args = append([]string{"--seccomp", "3"}, args...)
+	// Prepend --seccomp 3 to the bwrap args.
+	bwrapArgv = append([]string{"--seccomp", "3"}, bwrapArgv...)
 
-	// bash -c '... exec bwrap ARGS 3<FILTER_PATH' FILTER_PATH ARGS...
-	bashSnippet := `exec bwrap "$@" 3<"$0"`
-	fullArgs := append([]string{
-		"ip", "netns", "exec", ns.Name,
-		"runuser", "-u", user, "--",
-		"bash", "-c", bashSnippet, filterPath,
-	}, args...)
+	// Rewrite to: sh -c 'exec bwrap "$@" 3<"$0"' FILTER_PATH BWRAP_ARGS...
+	// __sandbox-init exec's the shell snippet which opens FD 3 and exec's bwrap.
+	// Pure POSIX (`exec`, `"$@"`, `3<"$0"`), so any /bin/sh works — no bash dep.
+	shSnippet := `exec bwrap "$@" 3<"$0"`
+	wrappedBwrap := append([]string{"sh", "-c", shSnippet, filterPath}, bwrapArgv...)
 
-	cmd := exec.Command("sudo", fullArgs...)
-	cmd.Stdin = os.Stdin
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	if err := cmd.Run(); err != nil {
-		// Preserve exit code from the inner command when possible
-		if exit, ok := err.(*exec.ExitError); ok {
-			os.Exit(exit.ExitCode())
+	// Start SNI proxy on host loopback. By default the proxy is silent so it
+	// doesn't garble interactive TUIs (claude code, codex, etc.); --verbose
+	// turns the per-connection ALLOW/BLOCK/error lines back on for debugging.
+	var logf func(string, ...any)
+	if verbose {
+		logf = func(format string, a ...any) {
+			fmt.Fprintf(os.Stderr, format+"\n", a...)
 		}
+	}
+	proxy, err := startSNIProxy(cfg.AllowedHosts, logf)
+	if err != nil {
 		return err
 	}
+	defer proxy.Close()
+
+	// Launch pasta -> __sandbox-init -> bash -> bwrap -> user command.
+	code, err := runPasta(proxy.Port(), wrappedBwrap)
+	if err != nil {
+		return err
+	}
+	if code != 0 {
+		return &exitError{code: code}
+	}
 	return nil
+}
+
+// normalizeHosts trims, lowercases, and dedupes hostnames, rejecting any that
+// contain whitespace or control characters, are IP literals, or refer to the
+// host's loopback. /etc/hosts is whitespace-delimited, so a value like
+// "a.com b.com" would silently produce two aliases on one line; the
+// SNI-allowlist comparison would also miss the second name.
+//
+// IP literals and loopback names are rejected because the SNI proxy on the
+// host would dial them as <addr>:443 — and the proxy lives in the host's
+// network namespace, so it would reach the host's services, defeating the
+// kernel-level egress containment. Users who genuinely want to gate access
+// to a hostname that resolves to loopback need a different design.
+func normalizeHosts(in []string) ([]string, error) {
+	seen := map[string]bool{}
+	out := make([]string, 0, len(in))
+	for _, raw := range in {
+		h := strings.ToLower(strings.TrimSpace(raw))
+		if h == "" {
+			continue
+		}
+		for _, r := range h {
+			if unicode.IsSpace(r) || unicode.IsControl(r) {
+				return nil, fmt.Errorf("invalid hostname %q: contains whitespace or control character", raw)
+			}
+		}
+		// Trim a single trailing dot so DNS-FQDN form ("localhost.") is
+		// normalized before the loopback check, which otherwise would miss it.
+		h = strings.TrimSuffix(h, ".")
+		if h == "" {
+			return nil, fmt.Errorf("invalid hostname %q: empty after normalization", raw)
+		}
+		if net.ParseIP(h) != nil {
+			return nil, fmt.Errorf("invalid hostname %q: IP literals are not allowed (use a hostname so SNI matching works)", raw)
+		}
+		if h == "localhost" || strings.HasSuffix(h, ".localhost") {
+			return nil, fmt.Errorf("invalid hostname %q: loopback names are not allowed", raw)
+		}
+		if seen[h] {
+			continue
+		}
+		seen[h] = true
+		out = append(out, h)
+	}
+	return out, nil
 }
 
 func dedupe(in []string) []string {

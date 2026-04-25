@@ -12,7 +12,7 @@ func TestRequiredFor_Untrusted(t *testing.T) {
 	// capability was added or removed, update the expected set AND think hard
 	// about whether it should be required or optional.
 	req := requiredFor("untrusted")
-	want := []string{"bwrap", "ip", "nft", "iptables", "sudo", "runuser", "seccomp"}
+	want := []string{"bwrap", "pasta", "nft", "ip", "seccomp"}
 	if len(req) != len(want) {
 		t.Errorf("untrusted requires %d caps, want %d: got %v", len(req), len(want), req)
 	}
@@ -56,11 +56,9 @@ func TestCapabilities_ValidateFor_ReportsAllMissing(t *testing.T) {
 	// the next, fix that, re-run, etc. — terrible UX.
 	caps := Capabilities{
 		{Name: "bwrap", Available: false, Reason: "bwrap not found in PATH"},
+		{Name: "pasta", Available: false, Reason: "pasta not found in PATH"},
+		{Name: "nft", Available: true},
 		{Name: "ip", Available: true},
-		{Name: "nft", Available: false, Reason: "nft not found in PATH"},
-		{Name: "iptables", Available: true},
-		{Name: "sudo", Available: true},
-		{Name: "runuser", Available: true},
 		{Name: "seccomp", Available: true},
 	}
 	err := caps.ValidateFor("untrusted")
@@ -71,8 +69,8 @@ func TestCapabilities_ValidateFor_ReportsAllMissing(t *testing.T) {
 	if !strings.Contains(msg, "bwrap") {
 		t.Errorf("error should mention missing bwrap: %v", err)
 	}
-	if !strings.Contains(msg, "nft") {
-		t.Errorf("error should mention missing nft: %v", err)
+	if !strings.Contains(msg, "pasta") {
+		t.Errorf("error should mention missing pasta: %v", err)
 	}
 }
 
@@ -91,11 +89,9 @@ func TestCapabilities_ValidateFor_IgnoresOptional(t *testing.T) {
 func TestCapabilities_ValidateFor_AllPresent(t *testing.T) {
 	caps := Capabilities{
 		{Name: "bwrap", Available: true},
-		{Name: "ip", Available: true},
+		{Name: "pasta", Available: true},
 		{Name: "nft", Available: true},
-		{Name: "iptables", Available: true},
-		{Name: "sudo", Available: true},
-		{Name: "runuser", Available: true},
+		{Name: "ip", Available: true},
 		{Name: "seccomp", Available: true},
 	}
 	if err := caps.ValidateFor("untrusted"); err != nil {
@@ -131,7 +127,7 @@ func TestCapabilities_Report_StatusMarkers(t *testing.T) {
 func TestDetectCapabilities_ReturnsAllKnownNames(t *testing.T) {
 	// Don't depend on what's installed on the test host — just assert shape.
 	caps := detectCapabilities()
-	want := []string{"bwrap", "ip", "nft", "iptables", "sudo", "runuser", "seccomp"}
+	want := []string{"bwrap", "pasta", "nft", "ip", "seccomp"}
 	for _, w := range want {
 		found := false
 		for _, c := range caps {

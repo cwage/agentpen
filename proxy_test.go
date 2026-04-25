@@ -1,0 +1,224 @@
+package main
+
+import (
+	"bufio"
+	"bytes"
+	"crypto/tls"
+	"encoding/binary"
+	"io"
+	"net"
+	"strings"
+	"testing"
+)
+
+// captureClientHello opens a TLS connection to a local listener and reads
+// the full first TLS record (the ClientHello). Reading by record-length
+// rather than a single buffered read avoids flakes when TCP fragments the
+// record or when the ClientHello is larger than the buffer.
+func captureClientHello(t *testing.T, sni string) []byte {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+
+	captured := make(chan []byte, 1)
+	go func() {
+		c, err := ln.Accept()
+		if err != nil {
+			captured <- nil
+			return
+		}
+		defer c.Close()
+		hdr := make([]byte, 5)
+		if _, err := io.ReadFull(c, hdr); err != nil {
+			captured <- nil
+			return
+		}
+		recLen := int(binary.BigEndian.Uint16(hdr[3:5]))
+		body := make([]byte, recLen)
+		if _, err := io.ReadFull(c, body); err != nil {
+			captured <- nil
+			return
+		}
+		captured <- append(append([]byte(nil), hdr...), body...)
+	}()
+
+	conn, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+	tc := tls.Client(conn, &tls.Config{ServerName: sni, InsecureSkipVerify: true})
+	// Handshake will fail (server speaks no TLS), but we get the ClientHello on the wire.
+	_ = tc.Handshake()
+	return <-captured
+}
+
+func TestPeekSNI_RealClientHello(t *testing.T) {
+	cases := []string{
+		"api.anthropic.com",
+		"api.openai.com",
+		"a.b.c.d.example.com",
+		"x.test", // very short
+	}
+	for _, want := range cases {
+		t.Run(want, func(t *testing.T) {
+			ch := captureClientHello(t, want)
+			if len(ch) == 0 {
+				t.Skip("captured nothing — local TLS plumbing failed")
+			}
+			br := bufio.NewReaderSize(bytes.NewReader(ch), 16384)
+			got, err := peekSNI(br)
+			if err != nil {
+				t.Fatalf("peekSNI: %v", err)
+			}
+			if got != want {
+				t.Errorf("peekSNI = %q, want %q", got, want)
+			}
+		})
+	}
+}
+
+func TestPeekSNI_PeekDoesNotConsume(t *testing.T) {
+	// Critical invariant for splice correctness: peekSNI must NOT advance the
+	// reader. Otherwise the upstream gets a truncated ClientHello and the
+	// handshake fails.
+	ch := captureClientHello(t, "api.anthropic.com")
+	if len(ch) == 0 {
+		t.Skip("captured nothing")
+	}
+	br := bufio.NewReaderSize(bytes.NewReader(ch), 16384)
+	_, _ = peekSNI(br)
+	// Buffered() should equal the full ClientHello length.
+	if br.Buffered() < len(ch) {
+		t.Errorf("peekSNI consumed bytes: Buffered=%d want >= %d", br.Buffered(), len(ch))
+	}
+}
+
+func TestPeekSNI_RejectsNonTLSRecord(t *testing.T) {
+	// First byte != 0x16 means not a handshake record.
+	junk := []byte{0x47, 0x45, 0x54, 0x20, 0x2f, 0x20} // "GET / "
+	br := bufio.NewReaderSize(bytes.NewReader(junk), 256)
+	_, err := peekSNI(br)
+	if err == nil {
+		t.Fatal("peekSNI should reject non-TLS record")
+	}
+	if !strings.Contains(err.Error(), "TLS handshake") {
+		t.Errorf("error message should call out non-TLS record: %v", err)
+	}
+}
+
+func TestPeekSNI_RejectsTruncatedHeader(t *testing.T) {
+	// Only 3 bytes — not even the TLS record header.
+	br := bufio.NewReaderSize(bytes.NewReader([]byte{0x16, 0x03, 0x01}), 256)
+	if _, err := peekSNI(br); err == nil {
+		t.Fatal("peekSNI should reject truncated header")
+	}
+}
+
+func TestPeekSNI_RejectsImplausibleLength(t *testing.T) {
+	// Record header claims length = 65535, way past TLS max (16384).
+	hdr := []byte{0x16, 0x03, 0x01, 0xff, 0xff}
+	br := bufio.NewReaderSize(bytes.NewReader(hdr), 8192)
+	if _, err := peekSNI(br); err == nil {
+		t.Fatal("peekSNI should reject implausible record length")
+	}
+}
+
+func TestPeekSNI_FragmentedClientHello(t *testing.T) {
+	// TLS allows a ClientHello to be split across multiple handshake-protocol
+	// records. Real clients almost never do this, but spec-conformant ones can
+	// — and an earlier version of peekSNI rejected the fragmented case as
+	// "ClientHello truncated". Re-frame a real single-record ClientHello as
+	// two records and confirm peekSNI assembles + parses them correctly.
+	full := captureClientHello(t, "api.anthropic.com")
+	if len(full) < 10 {
+		t.Skip("captured nothing usable")
+	}
+	body := full[5:] // strip the original record header
+	if len(body) < 4 {
+		t.Skip("body too short to fragment")
+	}
+	mid := len(body) / 2
+
+	var fragmented []byte
+	framePart := func(b []byte) {
+		hdr := []byte{0x16, full[1], full[2], 0, 0}
+		binary.BigEndian.PutUint16(hdr[3:5], uint16(len(b)))
+		fragmented = append(fragmented, hdr...)
+		fragmented = append(fragmented, b...)
+	}
+	framePart(body[:mid])
+	framePart(body[mid:])
+
+	br := bufio.NewReaderSize(bytes.NewReader(fragmented), maxHandshakeLen+8*5)
+	got, err := peekSNI(br)
+	if err != nil {
+		t.Fatalf("peekSNI on fragmented ClientHello: %v", err)
+	}
+	if got != "api.anthropic.com" {
+		t.Errorf("peekSNI = %q, want api.anthropic.com", got)
+	}
+	if br.Buffered() < len(fragmented) {
+		t.Errorf("peekSNI consumed bytes across records; Buffered=%d want >= %d",
+			br.Buffered(), len(fragmented))
+	}
+}
+
+func TestIsPublicRoutableIP(t *testing.T) {
+	cases := map[string]bool{
+		// public — should be allowed
+		"1.1.1.1":           true,
+		"8.8.8.8":           true,
+		"160.79.104.10":     true, // claudeusercontent etc.
+		"2606:4700:4700::1": true, // public IPv6
+		// non-routable — must reject
+		"127.0.0.1":     false,
+		"127.0.0.5":     false,
+		"::1":           false,
+		"10.0.0.1":      false,
+		"172.16.0.1":    false,
+		"192.168.1.1":   false,
+		"169.254.1.1":   false, // link-local
+		"100.64.0.1":    false, // CGN
+		"192.0.2.5":     false, // documentation (we use this internally)
+		"198.51.100.7":  false, // TEST-NET-2
+		"203.0.113.9":   false, // TEST-NET-3
+		"198.18.0.5":    false, // benchmark
+		"240.0.0.1":     false, // reserved class E
+		"0.0.0.0":       false, // unspecified
+		"224.0.0.1":     false, // multicast
+		"fe80::1":       false, // IPv6 link-local
+		"fc00::1":       false, // ULA
+		"2001:db8::1":   false, // documentation
+	}
+	for s, want := range cases {
+		ip := net.ParseIP(s)
+		if ip == nil {
+			t.Fatalf("ParseIP(%q) returned nil", s)
+		}
+		got := isPublicRoutableIP(ip)
+		if got != want {
+			t.Errorf("isPublicRoutableIP(%s) = %v, want %v", s, got, want)
+		}
+	}
+}
+
+func TestPeekSNI_LowercasesName(t *testing.T) {
+	// SNI in TLS is case-insensitive; we normalize so the allowlist comparison works.
+	// Hand-craft a minimal ClientHello with mixed-case SNI by capturing then patching.
+	ch := captureClientHello(t, "API.Anthropic.COM")
+	if len(ch) == 0 {
+		t.Skip("captured nothing")
+	}
+	br := bufio.NewReaderSize(bytes.NewReader(ch), 16384)
+	got, err := peekSNI(br)
+	if err != nil {
+		t.Fatalf("peekSNI: %v", err)
+	}
+	if got != "api.anthropic.com" {
+		t.Errorf("peekSNI = %q, want lowercased %q", got, "api.anthropic.com")
+	}
+}

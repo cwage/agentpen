@@ -10,8 +10,10 @@ import (
 )
 
 // stageEtc builds a per-run /etc directory copied from host /etc with pinned
-// hosts entries and a blank resolv.conf. Returned path must be rm -rf'd by caller.
-func stageEtc(allowedHosts []string, hostIPs map[string]string) (string, error) {
+// hosts entries and a blank resolv.conf. Each allowed hostname is mapped to
+// 127.0.0.1 — that's the in-namespace forwarder, which splices to the SNI
+// proxy on the host. Returned path must be rm -rf'd by caller.
+func stageEtc(allowedHosts []string) (string, error) {
 	dir, err := os.MkdirTemp("", "agentpen-etc-*")
 	if err != nil {
 		return "", err
@@ -30,9 +32,7 @@ func stageEtc(allowedHosts []string, hostIPs map[string]string) (string, error) 
 	var hosts strings.Builder
 	hosts.WriteString("127.0.0.1 localhost\n")
 	for _, h := range allowedHosts {
-		if ip, ok := hostIPs[h]; ok {
-			fmt.Fprintf(&hosts, "%s %s\n", ip, h)
-		}
+		fmt.Fprintf(&hosts, "127.0.0.1 %s\n", h)
 	}
 	if err := os.WriteFile(filepath.Join(dir, "hosts"), []byte(hosts.String()), 0644); err != nil {
 		os.RemoveAll(dir)
@@ -43,19 +43,6 @@ func stageEtc(allowedHosts []string, hostIPs map[string]string) (string, error) 
 		return "", err
 	}
 	return dir, nil
-}
-
-// firstIPFor returns one IPv4 per hostname, used to populate /etc/hosts.
-func firstIPFor(hosts []string) map[string]string {
-	out := map[string]string{}
-	for _, h := range hosts {
-		ips, err := resolveHosts([]string{h})
-		if err != nil || len(ips) == 0 {
-			continue
-		}
-		out[h] = ips[0]
-	}
-	return out
 }
 
 // bwrapArgs builds the argv to bwrap for the untrusted profile.

@@ -9,17 +9,32 @@ MVP, Linux **x86_64 only** (the seccomp BPF filter is currently amd64-specific; 
 ## What the untrusted profile blocks
 
 - **Filesystem**: `$HOME` becomes a fresh tmpfs; only the project directory is writable; credentials (`~/.ssh`, `~/.aws`, `~/.gnupg`) and sibling repos are invisible.
-- **Network**: netns + nftables allowlist — only the agent's API endpoints reachable; DNS pinned to `/etc/hosts`; everything else drops.
+- **Network**: pasta-managed userns + a /32 route to the gateway + an in-namespace nft rule → no default route, no kernel-level reachability outside a single allowed flow. The agent's `/etc/hosts` maps allowed hostnames to an in-namespace forwarder, which splices to an SNI-sniffing TCP proxy on host loopback that gates outbound by hostname (no TLS termination, no MITM). Direct-IP egress and non-proxy ports on the host's loopback are both rejected. The allowlist refuses loopback names and IP literals so the host-side proxy can't be steered into dialing local services.
 - **Env**: scrubbed, with per-agent passthrough only (no `SSH_AUTH_SOCK`, no arbitrary host env).
 - **Seccomp** (amd64): BPF filter blocking `ptrace`, `keyctl` family, `mount`/`pivot_root`, `bpf`, kernel module syscalls, `reboot`/`kexec`, and other kernel-touching vectors.
+
+Rootless: no `sudo`, no `setcap`, no sysctl tweaks, no persistent host state. The whole sandbox tears down with the process. `nft` is required as a runtime binary, but it runs inside the sandbox's unprivileged user namespace — `CAP_NET_ADMIN` there is scoped to that namespace, so no host-level privilege is involved and the rules disappear when the namespace is torn down. (The original "drop nft" goal in issue #15 was about removing host-privileged `sudo nft`, not removing the `nft` binary dependency itself.)
 
 Not defended against: steganographic exfil inside prompt bodies (a fundamental limit); a malicious agent binary stealing the API credential still in-sandbox (phase 2 work, see `notes.md`).
 
 ## Requirements
 
-Runtime: `bubblewrap`, `nftables`, `iproute2`, `iptables`, `sudo`, `runuser`, and a Linux kernel with user namespaces enabled.
+Runtime: `bubblewrap`, `passt` (provides `pasta`), `nftables`, `iproute2`, and a Linux kernel with user namespaces enabled.
 
 Run `agentpen --check` to report which layers this host can actually enforce.
+
+### Installing `passt` on systems where it isn't packaged
+
+`passt` is in repos for Debian 12+, Ubuntu 23.10+, Fedora 38+, Arch, Alpine, NixOS, etc. — install with the usual package manager. For older releases (notably Ubuntu 22.04 LTS), build from upstream source — it's a small pure-C codebase with no exotic deps:
+
+```
+git clone https://passt.top/passt
+cd passt
+make
+make prefix=$HOME/.local install   # or sudo make install for /usr/local
+```
+
+Auditable (~26K lines of C, single tree), reproducible, and pinned by the commit hash you cloned. Don't `curl | sh` a binary off the internet — for a tool whose job is to gate egress, the supply chain matters.
 
 ## Build
 

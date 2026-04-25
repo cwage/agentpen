@@ -385,11 +385,12 @@ func TestBwrapArgs_EnvForwarding(t *testing.T) {
 
 func TestStageEtc_HostsAndResolvConf(t *testing.T) {
 	// stageEtc copies /etc/ (best-effort), then overwrites hosts/resolv.conf
-	// with the sandbox-pinned versions.
+	// with sandbox-pinned versions where every allowed hostname resolves to
+	// 127.0.0.1 — the in-namespace forwarder, which splices to the SNI proxy
+	// on the host.
 	allowed := []string{"api.anthropic.com", "example.invalid"}
-	ips := map[string]string{"api.anthropic.com": "10.0.0.5"}
 
-	dir, err := stageEtc(allowed, ips)
+	dir, err := stageEtc(allowed)
 	if err != nil {
 		t.Fatalf("stageEtc: %v", err)
 	}
@@ -403,12 +404,11 @@ func TestStageEtc_HostsAndResolvConf(t *testing.T) {
 	if !strings.Contains(got, "127.0.0.1 localhost") {
 		t.Errorf("hosts missing localhost entry:\n%s", got)
 	}
-	if !strings.Contains(got, "10.0.0.5 api.anthropic.com") {
-		t.Errorf("hosts missing resolved entry:\n%s", got)
-	}
-	// Unresolved hosts are silently dropped — they simply don't appear.
-	if strings.Contains(got, "example.invalid") {
-		t.Errorf("hosts should not contain unresolved host:\n%s", got)
+	for _, h := range allowed {
+		want := "127.0.0.1 " + h
+		if !strings.Contains(got, want) {
+			t.Errorf("hosts missing %q:\n%s", want, got)
+		}
 	}
 
 	resolv, err := os.ReadFile(filepath.Join(dir, "resolv.conf"))
