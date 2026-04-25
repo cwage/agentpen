@@ -23,14 +23,17 @@ const (
 )
 
 // runSandboxInit runs inside pasta's userns+netns. It:
-//   1. brings up lo and eth0 with our pinned address and a /32 route to the gateway,
+//   1. brings up lo and the namespace's tap interface (whose name pasta picks
+//      after the host's outbound interface — we discover it via findSandboxIface
+//      rather than hardcoding) with our pinned address and a /32 route to
+//      the gateway,
 //   2. installs an nft egress filter so the only reachable host-side endpoint
 //      is the SNI proxy port (without this, pasta's --map-host-loopback would
 //      let the sandbox dial any port on the host's 127.0.0.1 — every dev
 //      service, every database, every IPC-as-TCP socket),
 //   3. starts the forwarder as a separate process,
-//   4. exec's the supplied inner command (typically a bash wrapper that opens
-//      the seccomp BPF as FD 3 and exec's bwrap).
+//   4. exec's the supplied inner command (typically a /bin/sh wrapper that
+//      opens the seccomp BPF as FD 3 and exec's bwrap).
 //
 // Argv shape:
 //   agentpen __sandbox-init <proxy-port> -- <prog> [<args>...]

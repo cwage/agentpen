@@ -264,10 +264,11 @@ func run() error {
 	// Prepend --seccomp 3 to the bwrap args.
 	bwrapArgv = append([]string{"--seccomp", "3"}, bwrapArgv...)
 
-	// Rewrite to: bash -c 'exec bwrap "$@" 3<"$0"' FILTER_PATH BWRAP_ARGS...
-	// __sandbox-init exec's this bash snippet which opens FD 3 and finally exec's bwrap.
-	bashSnippet := `exec bwrap "$@" 3<"$0"`
-	wrappedBwrap := append([]string{"bash", "-c", bashSnippet, filterPath}, bwrapArgv...)
+	// Rewrite to: sh -c 'exec bwrap "$@" 3<"$0"' FILTER_PATH BWRAP_ARGS...
+	// __sandbox-init exec's the shell snippet which opens FD 3 and exec's bwrap.
+	// Pure POSIX (`exec`, `"$@"`, `3<"$0"`), so any /bin/sh works — no bash dep.
+	shSnippet := `exec bwrap "$@" 3<"$0"`
+	wrappedBwrap := append([]string{"sh", "-c", shSnippet, filterPath}, bwrapArgv...)
 
 	// Start SNI proxy on host loopback.
 	proxy, err := startSNIProxy(cfg.AllowedHosts, func(format string, a ...any) {

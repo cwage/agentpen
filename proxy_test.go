@@ -127,6 +127,46 @@ func TestPeekSNI_RejectsImplausibleLength(t *testing.T) {
 	}
 }
 
+func TestPeekSNI_FragmentedClientHello(t *testing.T) {
+	// TLS allows a ClientHello to be split across multiple handshake-protocol
+	// records. Real clients almost never do this, but spec-conformant ones can
+	// — and an earlier version of peekSNI rejected the fragmented case as
+	// "ClientHello truncated". Re-frame a real single-record ClientHello as
+	// two records and confirm peekSNI assembles + parses them correctly.
+	full := captureClientHello(t, "api.anthropic.com")
+	if len(full) < 10 {
+		t.Skip("captured nothing usable")
+	}
+	body := full[5:] // strip the original record header
+	if len(body) < 4 {
+		t.Skip("body too short to fragment")
+	}
+	mid := len(body) / 2
+
+	var fragmented []byte
+	framePart := func(b []byte) {
+		hdr := []byte{0x16, full[1], full[2], 0, 0}
+		binary.BigEndian.PutUint16(hdr[3:5], uint16(len(b)))
+		fragmented = append(fragmented, hdr...)
+		fragmented = append(fragmented, b...)
+	}
+	framePart(body[:mid])
+	framePart(body[mid:])
+
+	br := bufio.NewReaderSize(bytes.NewReader(fragmented), maxHandshakeLen+8*5)
+	got, err := peekSNI(br)
+	if err != nil {
+		t.Fatalf("peekSNI on fragmented ClientHello: %v", err)
+	}
+	if got != "api.anthropic.com" {
+		t.Errorf("peekSNI = %q, want api.anthropic.com", got)
+	}
+	if br.Buffered() < len(fragmented) {
+		t.Errorf("peekSNI consumed bytes across records; Buffered=%d want >= %d",
+			br.Buffered(), len(fragmented))
+	}
+}
+
 func TestPeekSNI_LowercasesName(t *testing.T) {
 	// SNI in TLS is case-insensitive; we normalize so the allowlist comparison works.
 	// Hand-craft a minimal ClientHello with mixed-case SNI by capturing then patching.

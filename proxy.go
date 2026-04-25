@@ -16,6 +16,12 @@ import (
 // would require non-conformant ClientHellos.
 const maxTLSRecordLen = 16384
 
+// Cap on assembled handshake bytes we'll buffer while peeking. Real-world
+// ClientHellos are well under one record (~2-4KB even with PQ keyshares);
+// the spec allows up to 2^24-1 but anything that big is either pathological
+// or hostile. 64KiB covers the realistic multi-record case with margin.
+const maxHandshakeLen = 64 * 1024
+
 // Max wall-clock lifetime for a single proxied connection. Bounds host-side
 // resource exposure if a sandbox holds connections open without doing I/O.
 // Real API calls — including long streaming responses — finish well below this.
@@ -72,7 +78,10 @@ func (p *sniProxy) handle(client net.Conn) {
 
 	// 5-byte record header + max record body (16384). Without the +5 a
 	// max-sized ClientHello would trip ErrBufferFull in peekSNI's Peek(5+recLen).
-	br := bufio.NewReaderSize(client, 5+maxTLSRecordLen)
+	// Sized to hold a worst-case handshake spread across several records plus
+	// their per-record framing. Most ClientHellos arrive in one record well
+	// under this; the headroom is for fragmented multi-record handshakes.
+	br := bufio.NewReaderSize(client, maxHandshakeLen+8*5)
 	sni, err := peekSNI(br)
 	if err != nil {
 		p.logf("sni proxy: %s: peek SNI: %v", client.RemoteAddr(), err)
@@ -133,33 +142,79 @@ func closeWrite(c net.Conn) {
 
 // peekSNI parses just enough of a TLS ClientHello (RFC 8446 §4 / RFC 5246 §7.4)
 // to extract the SNI host_name. It reads via Peek() so the bytes remain in the
-// reader for the spliced upstream to receive verbatim.
+// reader for the spliced upstream to receive verbatim. Handles the common case
+// of a single-record handshake plus the rare fragmented case where the
+// ClientHello spans multiple TLS records.
 func peekSNI(br *bufio.Reader) (string, error) {
-	hdr, err := br.Peek(5)
+	hs, err := peekHandshake(br)
 	if err != nil {
-		return "", fmt.Errorf("peek record header: %w", err)
+		return "", err
 	}
-	if hdr[0] != 0x16 {
-		return "", fmt.Errorf("not a TLS handshake record (got 0x%02x)", hdr[0])
-	}
-	recLen := int(binary.BigEndian.Uint16(hdr[3:5]))
-	if recLen < 42 || recLen > maxTLSRecordLen {
-		return "", fmt.Errorf("implausible record length %d", recLen)
-	}
-	full, err := br.Peek(5 + recLen)
-	if err != nil {
-		return "", fmt.Errorf("peek record body: %w", err)
-	}
-	body := full[5:]
+	return parseClientHelloSNI(hs)
+}
 
-	if len(body) < 4 || body[0] != 0x01 {
+// peekHandshake assembles the TLS handshake message bytes (handshake header
+// + body, no record framing) by peeking one or more record-level fragments
+// from br. The bufio.Reader is not advanced so the splice still gets the
+// original byte stream verbatim.
+func peekHandshake(br *bufio.Reader) ([]byte, error) {
+	var hs []byte
+	var hsTotal int // expected handshake message length, set after first 4 bytes
+	pos := 0        // peek offset within br
+
+	for {
+		// Peek the next record header.
+		buf, err := br.Peek(pos + 5)
+		if err != nil {
+			return nil, fmt.Errorf("peek record header at %d: %w", pos, err)
+		}
+		hdr := buf[pos : pos+5]
+		if hdr[0] != 0x16 {
+			return nil, fmt.Errorf("not a TLS handshake record (got 0x%02x)", hdr[0])
+		}
+		recLen := int(binary.BigEndian.Uint16(hdr[3:5]))
+		if recLen < 1 || recLen > maxTLSRecordLen {
+			return nil, fmt.Errorf("implausible record length %d", recLen)
+		}
+		// Peek the full record body.
+		buf, err = br.Peek(pos + 5 + recLen)
+		if err != nil {
+			return nil, fmt.Errorf("peek record body at %d: %w", pos, err)
+		}
+		hs = append(hs, buf[pos+5:pos+5+recLen]...)
+		pos += 5 + recLen
+
+		// As soon as we have the 4-byte handshake header, lock in the total length.
+		if hsTotal == 0 && len(hs) >= 4 {
+			if hs[0] != 0x01 {
+				return nil, fmt.Errorf("not a ClientHello (got 0x%02x)", hs[0])
+			}
+			hsTotal = 4 + (int(hs[1])<<16 | int(hs[2])<<8 | int(hs[3]))
+			if hsTotal > maxHandshakeLen {
+				return nil, fmt.Errorf("ClientHello too large: %d bytes", hsTotal-4)
+			}
+		}
+		if hsTotal > 0 && len(hs) >= hsTotal {
+			return hs[:hsTotal], nil
+		}
+		if pos > maxHandshakeLen {
+			return nil, errors.New("ran out of peek budget without complete handshake")
+		}
+	}
+}
+
+// parseClientHelloSNI walks an assembled TLS handshake message (starting at
+// HandshakeType + length) and returns the lowercased SNI host_name from the
+// extension list.
+func parseClientHelloSNI(hs []byte) (string, error) {
+	if len(hs) < 4 || hs[0] != 0x01 {
 		return "", errors.New("not a ClientHello")
 	}
-	hsLen := int(body[1])<<16 | int(body[2])<<8 | int(body[3])
-	if 4+hsLen > len(body) {
+	hsBodyLen := int(hs[1])<<16 | int(hs[2])<<8 | int(hs[3])
+	if 4+hsBodyLen > len(hs) {
 		return "", errors.New("ClientHello truncated")
 	}
-	p := body[4 : 4+hsLen]
+	p := hs[4 : 4+hsBodyLen]
 
 	if len(p) < 34 {
 		return "", errors.New("ClientHello too short")

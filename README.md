@@ -13,7 +13,7 @@ MVP, Linux **x86_64 only** (the seccomp BPF filter is currently amd64-specific; 
 - **Env**: scrubbed, with per-agent passthrough only (no `SSH_AUTH_SOCK`, no arbitrary host env).
 - **Seccomp** (amd64): BPF filter blocking `ptrace`, `keyctl` family, `mount`/`pivot_root`, `bpf`, kernel module syscalls, `reboot`/`kexec`, and other kernel-touching vectors.
 
-Rootless: no `sudo`, no `setcap`, no sysctl tweaks, no persistent host state. The whole sandbox tears down with the process. `nft` rules live in the sandbox's userns and disappear with it.
+Rootless: no `sudo`, no `setcap`, no sysctl tweaks, no persistent host state. The whole sandbox tears down with the process. `nft` is required as a runtime binary, but it runs inside the sandbox's unprivileged user namespace — `CAP_NET_ADMIN` there is scoped to that namespace, so no host-level privilege is involved and the rules disappear when the namespace is torn down. (The original "drop nft" goal in issue #15 was about removing host-privileged `sudo nft`, not removing the `nft` binary dependency itself.)
 
 Not defended against: steganographic exfil inside prompt bodies (a fundamental limit); a malicious agent binary stealing the API credential still in-sandbox (phase 2 work, see `notes.md`).
 
