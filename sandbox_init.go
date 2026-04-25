@@ -52,6 +52,9 @@ func runSandboxInit(args []string) error {
 	if err != nil {
 		return fmt.Errorf("invalid proxy port %q: %w", args[0], err)
 	}
+	if port < 1 || port > 65535 {
+		return fmt.Errorf("proxy port out of range: %d", port)
+	}
 	rest := args[1:]
 	if len(rest) == 0 || rest[0] != "--" {
 		return fmt.Errorf("expected `--` separator before inner command")
@@ -119,12 +122,13 @@ func configureNetns() error {
 	if err != nil {
 		return err
 	}
+	addrCIDR := fmt.Sprintf("%s/%d", sandboxOwnIP, sandboxNetMaskBits)
 	steps := [][]string{
 		// lo is down by default in a fresh netns. The forwarder binds 127.0.0.1
 		// and user code dials 127.0.0.1; both fail without this.
 		{"ip", "link", "set", "lo", "up"},
 		{"ip", "link", "set", iface, "up"},
-		{"ip", "addr", "add", sandboxOwnIP + "/32", "dev", iface},
+		{"ip", "addr", "add", addrCIDR, "dev", iface},
 		{"ip", "route", "add", sandboxGatewayIP, "dev", iface},
 	}
 	for _, s := range steps {
