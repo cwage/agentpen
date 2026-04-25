@@ -25,6 +25,19 @@ Runtime: `bubblewrap`, `passt` (provides `pasta`), `iproute2`, and a Linux kerne
 
 Run `agentpen --check` to report which layers this host can actually enforce.
 
+### Installing `passt` on systems where it isn't packaged
+
+`passt` is in repos for Debian 12+, Ubuntu 23.10+, Fedora 38+, Arch, Alpine, NixOS, etc. — install with the usual package manager. For older releases (notably Ubuntu 22.04 LTS), build from upstream source — it's a small pure-C codebase with no exotic deps:
+
+```
+git clone https://passt.top/passt
+cd passt
+make
+make prefix=$HOME/.local install   # or sudo make install for /usr/local
+```
+
+Auditable (~26K lines of C, single tree), reproducible, and pinned by the commit hash you cloned. Don't `curl | sh` a binary off the internet — for a tool whose job is to gate egress, the supply chain matters.
+
 ## Build
 
 With Nix (recommended, no host pollution):

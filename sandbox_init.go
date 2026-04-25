@@ -19,7 +19,6 @@ const (
 	sandboxGatewayIP   = "192.0.2.1" // RFC 5737 documentation prefix
 	sandboxOwnIP       = "192.0.2.2"
 	sandboxNetMaskBits = 29
-	sandboxNetIface    = "eth0"
 	forwarderListen    = "127.0.0.1:443"
 )
 
@@ -73,13 +72,17 @@ func runSandboxInit(args []string) error {
 }
 
 func configureNetns() error {
+	iface, err := findSandboxIface()
+	if err != nil {
+		return err
+	}
 	steps := [][]string{
 		// lo is down by default in a fresh netns. The forwarder binds 127.0.0.1
 		// and user code dials 127.0.0.1; both fail without this.
 		{"ip", "link", "set", "lo", "up"},
-		{"ip", "link", "set", sandboxNetIface, "up"},
-		{"ip", "addr", "add", sandboxOwnIP + "/32", "dev", sandboxNetIface},
-		{"ip", "route", "add", sandboxGatewayIP, "dev", sandboxNetIface},
+		{"ip", "link", "set", iface, "up"},
+		{"ip", "addr", "add", sandboxOwnIP + "/32", "dev", iface},
+		{"ip", "route", "add", sandboxGatewayIP, "dev", iface},
 	}
 	for _, s := range steps {
 		out, err := exec.Command(s[0], s[1:]...).CombinedOutput()
@@ -88,6 +91,24 @@ func configureNetns() error {
 		}
 	}
 	return nil
+}
+
+// findSandboxIface returns the name of the non-loopback interface in the
+// current netns. Pasta creates exactly one tap and names it after the host's
+// outbound interface by default (eno1, enp3s0, eth0, wlan0, …) — host-
+// dependent, so we discover the name at runtime instead of hardcoding it.
+func findSandboxIface() (string, error) {
+	ifs, err := net.Interfaces()
+	if err != nil {
+		return "", fmt.Errorf("list interfaces: %w", err)
+	}
+	for _, i := range ifs {
+		if i.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		return i.Name, nil
+	}
+	return "", fmt.Errorf("no non-loopback interface in sandbox netns")
 }
 
 // spawnForwarder launches `agentpen __forwarder` as a separate process and

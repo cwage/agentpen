@@ -22,6 +22,9 @@ func pastaArgs(proxyPort int, selfPath string, bwrapArgv []string) []string {
 	args := []string{
 		"-q", "-f",
 		"--no-dhcp", "--no-dhcpv6", "--no-ndp", "--no-ra",
+		// Don't pin the namespace interface name — pasta names the tap after
+		// the host's outbound interface (eno1, enp3s0, wlan0, eth0, …) and
+		// we discover whatever it picked from inside the namespace at runtime.
 		"-a", sandboxOwnIP, "-n", fmt.Sprintf("%d", sandboxNetMaskBits), "-g", sandboxGatewayIP,
 		"--map-host-loopback", sandboxGatewayIP,
 		"--",
