@@ -55,13 +55,16 @@ func TestNormalizeHosts_RejectsLoopbackAndIPLiterals(t *testing.T) {
 	// normalizeHosts rejects these at config time.
 	cases := []string{
 		"localhost",
-		"LocalHost", // case-insensitive
+		"LocalHost",     // case-insensitive
+		"localhost.",    // DNS-FQDN form
+		"LocalHost.",    // both
 		"foo.localhost",
+		"foo.localhost.", // FQDN form of the .localhost suffix
 		"127.0.0.1",
 		"127.99.99.99",
 		"::1",
-		"10.0.0.5",          // IP literal — not necessarily loopback, but no SNI semantics
-		"2001:db8::1",       // IPv6 literal
+		"10.0.0.5",      // IP literal — not necessarily loopback, but no SNI semantics
+		"2001:db8::1",   // IPv6 literal
 	}
 	for _, bad := range cases {
 		t.Run(bad, func(t *testing.T) {

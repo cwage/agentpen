@@ -13,6 +13,12 @@ import (
 // the rest of the design treats forwarder DoS as a self-DoS.
 const forwarderDialTimeout = 10 * time.Second
 
+// forwarderConnMaxLifetime bounds total wall-clock per spliced connection.
+// Same role as proxyConnMaxLifetime on the host side: a sandbox process
+// opening many idle conns shouldn't be able to accumulate goroutines/FDs
+// indefinitely.
+const forwarderConnMaxLifetime = 1 * time.Hour
+
 // runForwarder is the in-namespace TCP splicer. It binds a low port on
 // loopback (free here because we run as userns-root in pasta's userns),
 // then for each connection opens a corresponding connection to upstream
@@ -48,6 +54,9 @@ func forwardOne(client net.Conn, upstreamAddr string) {
 		return
 	}
 	defer upstream.Close()
+	deadline := time.Now().Add(forwarderConnMaxLifetime)
+	_ = client.SetDeadline(deadline)
+	_ = upstream.SetDeadline(deadline)
 	// Same half-close pattern as the SNI proxy — shovel both ways, CloseWrite
 	// when one direction EOFs so the other can drain.
 	spliceConns(client, client, upstream)

@@ -95,9 +95,19 @@ func (p *sniProxy) handle(client net.Conn) {
 	}
 	p.logf("sni proxy: %s: ALLOW sni=%q", client.RemoteAddr(), sni)
 
-	upstream, err := net.DialTimeout("tcp", sni+":443", 10*time.Second)
+	// Resolve the SNI to an IP and reject anything not globally routable.
+	// Without this, a hostile DNS response that maps an allowlisted hostname
+	// to loopback or RFC1918 would steer this proxy (running in the host's
+	// network namespace) into dialing local services. Dial the chosen IP
+	// directly so a rebind between resolve-and-dial can't slip through.
+	ip, err := resolvePublicIP(sni)
 	if err != nil {
-		p.logf("sni proxy: dial upstream %q: %v", sni, err)
+		p.logf("sni proxy: resolve %q: %v", sni, err)
+		return
+	}
+	upstream, err := net.DialTimeout("tcp", net.JoinHostPort(ip.String(), "443"), 10*time.Second)
+	if err != nil {
+		p.logf("sni proxy: dial upstream %q (%s): %v", sni, ip, err)
 		return
 	}
 	defer upstream.Close()
@@ -138,6 +148,69 @@ func closeWrite(c net.Conn) {
 	if tc, ok := c.(*net.TCPConn); ok {
 		_ = tc.CloseWrite()
 	}
+}
+
+// resolvePublicIP looks up host and returns the first IP that's globally
+// routable — not loopback, private (RFC 1918), CGN (100.64.0.0/10),
+// link-local, multicast, unspecified, or in the documentation/benchmark
+// reserved ranges. Defends against DNS rebinding attacks where a hostile
+// resolver maps an allowlisted hostname to host-internal addresses to
+// steer the proxy into dialing local services.
+func resolvePublicIP(host string) (net.IP, error) {
+	ips, err := net.LookupIP(host)
+	if err != nil {
+		return nil, fmt.Errorf("lookup: %w", err)
+	}
+	for _, ip := range ips {
+		if isPublicRoutableIP(ip) {
+			return ip, nil
+		}
+	}
+	return nil, fmt.Errorf("no globally routable IP for %s (got %v)", host, ips)
+}
+
+// Reserved ranges that Go's net package doesn't classify on its own but
+// that we don't want the proxy ever dialing.
+var nonRoutableExtraCIDRs = func() []*net.IPNet {
+	cidrs := []string{
+		"100.64.0.0/10",     // RFC 6598 CGN / shared address space
+		"192.0.0.0/24",      // RFC 6890 IETF protocol assignments
+		"192.0.2.0/24",      // RFC 5737 TEST-NET-1 (we use this internally)
+		"192.88.99.0/24",    // RFC 7526 deprecated 6to4 anycast
+		"198.18.0.0/15",     // RFC 2544 benchmarking
+		"198.51.100.0/24",   // RFC 5737 TEST-NET-2
+		"203.0.113.0/24",    // RFC 5737 TEST-NET-3
+		"240.0.0.0/4",       // class E reserved
+		"::/128",            // unspecified IPv6 (also IsUnspecified)
+		"100::/64",          // discard prefix
+		"2001:db8::/32",     // IPv6 documentation
+		"fc00::/7",          // IPv6 ULA (Go's IsPrivate covers this in 1.17+)
+	}
+	out := make([]*net.IPNet, 0, len(cidrs))
+	for _, c := range cidrs {
+		_, n, err := net.ParseCIDR(c)
+		if err == nil {
+			out = append(out, n)
+		}
+	}
+	return out
+}()
+
+func isPublicRoutableIP(ip net.IP) bool {
+	if ip == nil {
+		return false
+	}
+	if ip.IsLoopback() || ip.IsPrivate() || ip.IsUnspecified() ||
+		ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsMulticast() ||
+		ip.IsInterfaceLocalMulticast() {
+		return false
+	}
+	for _, n := range nonRoutableExtraCIDRs {
+		if n.Contains(ip) {
+			return false
+		}
+	}
+	return true
 }
 
 // peekSNI parses just enough of a TLS ClientHello (RFC 8446 §4 / RFC 5246 §7.4)
@@ -197,7 +270,11 @@ func peekHandshake(br *bufio.Reader) ([]byte, error) {
 		if hsTotal > 0 && len(hs) >= hsTotal {
 			return hs[:hsTotal], nil
 		}
-		if pos > maxHandshakeLen {
+		// Budget on accumulated handshake bytes, not pos (which also counts
+		// record framing). Otherwise a fragmented ClientHello at exactly the
+		// cap would be wrongly rejected because of the per-record 5-byte
+		// header overhead.
+		if len(hs) > maxHandshakeLen {
 			return nil, errors.New("ran out of peek budget without complete handshake")
 		}
 	}

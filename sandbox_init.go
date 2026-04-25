@@ -16,9 +16,12 @@ import (
 // the namespace because we run pasta with --no-dhcp (DHCP would require an
 // extra client process inside; it's cleaner to configure statically).
 const (
-	sandboxGatewayIP   = "192.0.2.1" // RFC 5737 documentation prefix
-	sandboxOwnIP       = "192.0.2.2"
-	sandboxNetMaskBits = 29
+	sandboxGatewayIP = "192.0.2.1" // RFC 5737 documentation prefix
+	sandboxOwnIP     = "192.0.2.2"
+	// /32 matches the in-namespace config (single-host route to gateway only)
+	// so pasta's view doesn't install a connected route for 192.0.2.0/29 that
+	// would weaken the "no route to host except gateway" property.
+	sandboxNetMaskBits = 32
 	forwarderListen    = "127.0.0.1:443"
 )
 

@@ -314,6 +314,12 @@ func normalizeHosts(in []string) ([]string, error) {
 				return nil, fmt.Errorf("invalid hostname %q: contains whitespace or control character", raw)
 			}
 		}
+		// Trim a single trailing dot so DNS-FQDN form ("localhost.") is
+		// normalized before the loopback check, which otherwise would miss it.
+		h = strings.TrimSuffix(h, ".")
+		if h == "" {
+			return nil, fmt.Errorf("invalid hostname %q: empty after normalization", raw)
+		}
 		if net.ParseIP(h) != nil {
 			return nil, fmt.Errorf("invalid hostname %q: IP literals are not allowed (use a hostname so SNI matching works)", raw)
 		}

@@ -167,6 +167,45 @@ func TestPeekSNI_FragmentedClientHello(t *testing.T) {
 	}
 }
 
+func TestIsPublicRoutableIP(t *testing.T) {
+	cases := map[string]bool{
+		// public — should be allowed
+		"1.1.1.1":           true,
+		"8.8.8.8":           true,
+		"160.79.104.10":     true, // claudeusercontent etc.
+		"2606:4700:4700::1": true, // public IPv6
+		// non-routable — must reject
+		"127.0.0.1":     false,
+		"127.0.0.5":     false,
+		"::1":           false,
+		"10.0.0.1":      false,
+		"172.16.0.1":    false,
+		"192.168.1.1":   false,
+		"169.254.1.1":   false, // link-local
+		"100.64.0.1":    false, // CGN
+		"192.0.2.5":     false, // documentation (we use this internally)
+		"198.51.100.7":  false, // TEST-NET-2
+		"203.0.113.9":   false, // TEST-NET-3
+		"198.18.0.5":    false, // benchmark
+		"240.0.0.1":     false, // reserved class E
+		"0.0.0.0":       false, // unspecified
+		"224.0.0.1":     false, // multicast
+		"fe80::1":       false, // IPv6 link-local
+		"fc00::1":       false, // ULA
+		"2001:db8::1":   false, // documentation
+	}
+	for s, want := range cases {
+		ip := net.ParseIP(s)
+		if ip == nil {
+			t.Fatalf("ParseIP(%q) returned nil", s)
+		}
+		got := isPublicRoutableIP(ip)
+		if got != want {
+			t.Errorf("isPublicRoutableIP(%s) = %v, want %v", s, got, want)
+		}
+	}
+}
+
 func TestPeekSNI_LowercasesName(t *testing.T) {
 	// SNI in TLS is case-insensitive; we normalize so the allowlist comparison works.
 	// Hand-craft a minimal ClientHello with mixed-case SNI by capturing then patching.
