@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 )
 
@@ -63,6 +64,11 @@ func bwrapArgs(cfg runConfig, stageEtcPath string) []string {
 	args := []string{
 		"--unshare-user", "--unshare-ipc", "--unshare-pid", "--unshare-uts", "--unshare-cgroup",
 		"--die-with-parent", "--new-session", "--hostname", "agentpen",
+		// Pasta puts us in a userns where we're uid 0; without --uid, bwrap
+		// preserves that, and agents like `claude --dangerously-skip-permissions`
+		// refuse to run as root. Map back to the real host uid/gid.
+		"--uid", strconv.Itoa(os.Getuid()),
+		"--gid", strconv.Itoa(os.Getgid()),
 		"--clearenv",
 		"--setenv", "HOME", cfg.Home,
 		"--setenv", "USER", cfg.User,
