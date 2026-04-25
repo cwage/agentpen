@@ -4,7 +4,14 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"time"
 )
+
+// forwarderDialTimeout caps how long a single inbound connection waits for
+// the upstream connect. Without it, hung upstreams (SYN retries) would let
+// goroutines accumulate one per inbound — easy self-DoS surface even though
+// the rest of the design treats forwarder DoS as a self-DoS.
+const forwarderDialTimeout = 10 * time.Second
 
 // runForwarder is the in-namespace TCP splicer. It binds a low port on
 // loopback (free here because we run as userns-root in pasta's userns),
@@ -36,7 +43,7 @@ func runForwarder(args []string) error {
 
 func forwardOne(client net.Conn, upstreamAddr string) {
 	defer client.Close()
-	upstream, err := net.Dial("tcp", upstreamAddr)
+	upstream, err := net.DialTimeout("tcp", upstreamAddr, forwarderDialTimeout)
 	if err != nil {
 		return
 	}

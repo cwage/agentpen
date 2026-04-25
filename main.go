@@ -4,6 +4,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"sort"
@@ -53,9 +54,9 @@ func usage() {
 	fmt.Fprintf(os.Stderr, `usage: agentpen [options] [--] <command> [args...]
        agentpen --check
 
-Runs <command> inside a confined sandbox (pasta + bwrap + seccomp) with an
-SNI-gated network egress proxy on host loopback. No sudo, no setcap, no
-persistent host state.
+Runs <command> inside a confined sandbox (pasta + bwrap + nft + seccomp)
+with an SNI-gated network egress proxy on host loopback. No sudo, no
+setcap, no persistent host state.
 
 options:
   --profile P      profile: untrusted (default), paranoid (not yet implemented)
@@ -289,10 +290,16 @@ func run() error {
 }
 
 // normalizeHosts trims, lowercases, and dedupes hostnames, rejecting any that
-// contain whitespace or control characters. /etc/hosts is whitespace-delimited,
-// so a value like "a.com b.com" would silently produce two aliases on one
-// line; the SNI-allowlist comparison would also miss the second name. Failing
-// fast with a clear error keeps both consumers honest.
+// contain whitespace or control characters, are IP literals, or refer to the
+// host's loopback. /etc/hosts is whitespace-delimited, so a value like
+// "a.com b.com" would silently produce two aliases on one line; the
+// SNI-allowlist comparison would also miss the second name.
+//
+// IP literals and loopback names are rejected because the SNI proxy on the
+// host would dial them as <addr>:443 — and the proxy lives in the host's
+// network namespace, so it would reach the host's services, defeating the
+// kernel-level egress containment. Users who genuinely want to gate access
+// to a hostname that resolves to loopback need a different design.
 func normalizeHosts(in []string) ([]string, error) {
 	seen := map[string]bool{}
 	out := make([]string, 0, len(in))
@@ -305,6 +312,12 @@ func normalizeHosts(in []string) ([]string, error) {
 			if unicode.IsSpace(r) || unicode.IsControl(r) {
 				return nil, fmt.Errorf("invalid hostname %q: contains whitespace or control character", raw)
 			}
+		}
+		if net.ParseIP(h) != nil {
+			return nil, fmt.Errorf("invalid hostname %q: IP literals are not allowed (use a hostname so SNI matching works)", raw)
+		}
+		if h == "localhost" || strings.HasSuffix(h, ".localhost") {
+			return nil, fmt.Errorf("invalid hostname %q: loopback names are not allowed", raw)
 		}
 		if seen[h] {
 			continue

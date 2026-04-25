@@ -48,6 +48,35 @@ func TestNormalizeHosts_RejectsBadInput(t *testing.T) {
 	}
 }
 
+func TestNormalizeHosts_RejectsLoopbackAndIPLiterals(t *testing.T) {
+	// The host-side SNI proxy lives in the host network namespace, so a value
+	// in the allowlist that resolves to (or *is*) a loopback/private address
+	// would let the sandbox steer the proxy into dialing host-local services.
+	// normalizeHosts rejects these at config time.
+	cases := []string{
+		"localhost",
+		"LocalHost", // case-insensitive
+		"foo.localhost",
+		"127.0.0.1",
+		"127.99.99.99",
+		"::1",
+		"10.0.0.5",          // IP literal — not necessarily loopback, but no SNI semantics
+		"2001:db8::1",       // IPv6 literal
+	}
+	for _, bad := range cases {
+		t.Run(bad, func(t *testing.T) {
+			_, err := normalizeHosts([]string{bad})
+			if err == nil {
+				t.Errorf("normalizeHosts(%q) accepted; want error", bad)
+				return
+			}
+			if !strings.Contains(err.Error(), "invalid hostname") {
+				t.Errorf("error should mention invalid hostname: %v", err)
+			}
+		})
+	}
+}
+
 func TestNormalizeHosts_PreservesOrder(t *testing.T) {
 	// Order matters for /etc/hosts readability and predictability of the
 	// allowlist comparison set; trim/lowercase shouldn't shuffle.

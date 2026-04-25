@@ -127,7 +127,7 @@ func TestCapabilities_Report_StatusMarkers(t *testing.T) {
 func TestDetectCapabilities_ReturnsAllKnownNames(t *testing.T) {
 	// Don't depend on what's installed on the test host — just assert shape.
 	caps := detectCapabilities()
-	want := []string{"bwrap", "pasta", "ip", "seccomp"}
+	want := []string{"bwrap", "pasta", "nft", "ip", "seccomp"}
 	for _, w := range want {
 		found := false
 		for _, c := range caps {

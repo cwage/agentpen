@@ -9,7 +9,7 @@ MVP, Linux **x86_64 only** (the seccomp BPF filter is currently amd64-specific; 
 ## What the untrusted profile blocks
 
 - **Filesystem**: `$HOME` becomes a fresh tmpfs; only the project directory is writable; credentials (`~/.ssh`, `~/.aws`, `~/.gnupg`) and sibling repos are invisible.
-- **Network**: pasta-managed userns + a /32 route to the gateway + an in-namespace nft rule → no default route, no kernel-level reachability outside a single allowed flow. The agent's `/etc/hosts` maps allowed hostnames to an in-namespace forwarder, which splices to an SNI-sniffing TCP proxy on host loopback that gates outbound by hostname (no TLS termination, no MITM). Direct-IP egress and any non-proxy port on the host's loopback are both rejected.
+- **Network**: pasta-managed userns + a /32 route to the gateway + an in-namespace nft rule → no default route, no kernel-level reachability outside a single allowed flow. The agent's `/etc/hosts` maps allowed hostnames to an in-namespace forwarder, which splices to an SNI-sniffing TCP proxy on host loopback that gates outbound by hostname (no TLS termination, no MITM). Direct-IP egress and non-proxy ports on the host's loopback are both rejected. The allowlist refuses loopback names and IP literals so the host-side proxy can't be steered into dialing local services.
 - **Env**: scrubbed, with per-agent passthrough only (no `SSH_AUTH_SOCK`, no arbitrary host env).
 - **Seccomp** (amd64): BPF filter blocking `ptrace`, `keyctl` family, `mount`/`pivot_root`, `bpf`, kernel module syscalls, `reboot`/`kexec`, and other kernel-touching vectors.
 
