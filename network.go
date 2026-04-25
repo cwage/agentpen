@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"syscall"
 )
 
 // pastaArgs returns the pasta(1) command line for launching the sandbox.
@@ -35,6 +36,10 @@ func pastaArgs(proxyPort int, selfPath string, bwrapArgv []string) []string {
 
 // runPasta launches pasta with the given bwrap argv inside, plumbing stdio
 // through. Returns the child's exit code (or -1 on launch error).
+//
+// If the child terminates by signal we map to the conventional 128+signum
+// exit code instead of letting *exec.ExitError's ExitCode() return -1, which
+// would otherwise propagate as os.Exit(255) and lose all signal context.
 func runPasta(proxyPort int, bwrapArgv []string) (int, error) {
 	pasta, err := exec.LookPath("pasta")
 	if err != nil {
@@ -49,10 +54,14 @@ func runPasta(proxyPort int, bwrapArgv []string) (int, error) {
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {
-		if exit, ok := err.(*exec.ExitError); ok {
-			return exit.ExitCode(), nil
+		exit, ok := err.(*exec.ExitError)
+		if !ok {
+			return -1, err
 		}
-		return -1, err
+		if ws, ok := exit.Sys().(syscall.WaitStatus); ok && ws.Signaled() {
+			return 128 + int(ws.Signal()), nil
+		}
+		return exit.ExitCode(), nil
 	}
 	return 0, nil
 }

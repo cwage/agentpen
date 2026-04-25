@@ -118,6 +118,11 @@ func findSandboxIface() (string, error) {
 // can SIGKILL it and self-DoS its own outbound. Documented limitation; not
 // a privilege boundary violation since the forwarder cannot route anywhere
 // the kernel /32 route + SNI proxy don't already gate.
+//
+// Readiness is racey: dial-loop until the listener accepts, child Wait() in
+// parallel — if the child exits before binding (e.g. EADDRINUSE), we surface
+// its real error instead of letting the dial loop run out the clock with a
+// generic "did not bind in time" message.
 func spawnForwarder(listen, upstream string) error {
 	self, err := os.Executable()
 	if err != nil {
@@ -129,12 +134,19 @@ func spawnForwarder(listen, upstream string) error {
 	if err := cmd.Start(); err != nil {
 		return err
 	}
-	// Brief readiness wait. We try to dial the listener; the child either
-	// exits on bind failure (we surface it) or starts accepting (we proceed).
+
+	childExit := make(chan error, 1)
+	go func() { childExit <- cmd.Wait() }()
+
 	deadline := time.Now().Add(2 * time.Second)
-	for {
-		if time.Now().After(deadline) {
-			return fmt.Errorf("forwarder did not bind %s in time", listen)
+	for time.Now().Before(deadline) {
+		select {
+		case err := <-childExit:
+			if err == nil {
+				return fmt.Errorf("forwarder exited before binding %s", listen)
+			}
+			return fmt.Errorf("forwarder exited before binding %s: %w", listen, err)
+		default:
 		}
 		c, err := net.DialTimeout("tcp", listen, 200*time.Millisecond)
 		if err == nil {
@@ -143,4 +155,5 @@ func spawnForwarder(listen, upstream string) error {
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
+	return fmt.Errorf("forwarder did not bind %s in time", listen)
 }

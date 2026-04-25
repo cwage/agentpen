@@ -4,13 +4,17 @@ import (
 	"bufio"
 	"bytes"
 	"crypto/tls"
+	"encoding/binary"
+	"io"
 	"net"
 	"strings"
 	"testing"
 )
 
-// captureClientHello opens a TLS connection to a local listener and stops as
-// soon as it has the ClientHello bytes (which is all peekSNI needs).
+// captureClientHello opens a TLS connection to a local listener and reads
+// the full first TLS record (the ClientHello). Reading by record-length
+// rather than a single buffered read avoids flakes when TCP fragments the
+// record or when the ClientHello is larger than the buffer.
 func captureClientHello(t *testing.T, sni string) []byte {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -27,9 +31,18 @@ func captureClientHello(t *testing.T, sni string) []byte {
 			return
 		}
 		defer c.Close()
-		buf := make([]byte, 4096)
-		n, _ := c.Read(buf)
-		captured <- append([]byte(nil), buf[:n]...)
+		hdr := make([]byte, 5)
+		if _, err := io.ReadFull(c, hdr); err != nil {
+			captured <- nil
+			return
+		}
+		recLen := int(binary.BigEndian.Uint16(hdr[3:5]))
+		body := make([]byte, recLen)
+		if _, err := io.ReadFull(c, body); err != nil {
+			captured <- nil
+			return
+		}
+		captured <- append(append([]byte(nil), hdr...), body...)
 	}()
 
 	conn, err := net.Dial("tcp", ln.Addr().String())

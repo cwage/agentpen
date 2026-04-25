@@ -78,15 +78,17 @@ func (p *sniProxy) handle(client net.Conn) {
 		p.logf("sni proxy: %s: peek SNI: %v", client.RemoteAddr(), err)
 		return
 	}
+	// SNI is attacker-controlled bytes — quote it in logs so a malicious
+	// client can't inject newlines or control characters into our output.
 	if !p.allowed[strings.ToLower(sni)] {
-		p.logf("sni proxy: %s: BLOCK sni=%s", client.RemoteAddr(), sni)
+		p.logf("sni proxy: %s: BLOCK sni=%q", client.RemoteAddr(), sni)
 		return
 	}
-	p.logf("sni proxy: %s: ALLOW sni=%s", client.RemoteAddr(), sni)
+	p.logf("sni proxy: %s: ALLOW sni=%q", client.RemoteAddr(), sni)
 
 	upstream, err := net.DialTimeout("tcp", sni+":443", 10*time.Second)
 	if err != nil {
-		p.logf("sni proxy: dial upstream %s: %v", sni, err)
+		p.logf("sni proxy: dial upstream %q: %v", sni, err)
 		return
 	}
 	defer upstream.Close()
