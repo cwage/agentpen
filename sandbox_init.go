@@ -24,18 +24,20 @@ const (
 
 // runSandboxInit runs inside pasta's userns+netns. It:
 //   1. brings up lo and eth0 with our pinned address and a /32 route to the gateway,
-//   2. starts the forwarder as a separate process. The forwarder runs at the
-//      same kernel-side uid as the user's code (pasta's userns maps only one
-//      uid), which means user code can SIGKILL it — accepted self-DoS, not
-//      a privilege boundary violation. See spawnForwarder.
-//   3. exec's the supplied inner command (typically a bash wrapper that opens
+//   2. installs an nft egress filter so the only reachable host-side endpoint
+//      is the SNI proxy port (without this, pasta's --map-host-loopback would
+//      let the sandbox dial any port on the host's 127.0.0.1 — every dev
+//      service, every database, every IPC-as-TCP socket),
+//   3. starts the forwarder as a separate process,
+//   4. exec's the supplied inner command (typically a bash wrapper that opens
 //      the seccomp BPF as FD 3 and exec's bwrap).
 //
 // Argv shape:
 //   agentpen __sandbox-init <proxy-port> -- <prog> [<args>...]
 //
-// We hold all caps here (userns-root in pasta's userns), so ip(8) calls and
-// the forwarder spawn need no extra privilege.
+// We hold all caps here (userns-root in pasta's userns), so ip(8), nft(8) and
+// the forwarder spawn need no extra privilege. CAP_NET_ADMIN is dropped by
+// bwrap before user code runs, locking the rules in place.
 func runSandboxInit(args []string) error {
 	if len(args) < 1 {
 		return fmt.Errorf("usage: agentpen __sandbox-init <proxy-port> -- <prog> [args...]")
@@ -56,6 +58,9 @@ func runSandboxInit(args []string) error {
 	if err := configureNetns(); err != nil {
 		return fmt.Errorf("netns config: %w", err)
 	}
+	if err := installEgressFilter(port); err != nil {
+		return fmt.Errorf("egress filter: %w", err)
+	}
 
 	upstream := net.JoinHostPort(sandboxGatewayIP, strconv.Itoa(port))
 	if err := spawnForwarder(forwarderListen, upstream); err != nil {
@@ -69,6 +74,38 @@ func runSandboxInit(args []string) error {
 	// syscall.Exec replaces this process; the forwarder (already a separate
 	// process) keeps running until pasta's pidns is torn down.
 	return syscall.Exec(prog, rest, os.Environ())
+}
+
+// egressFilterRules returns the nft ruleset that gates outbound traffic to
+// the host. Without this, pasta's --map-host-loopback gives the sandbox TCP
+// reachability to every port on the host's 127.0.0.1 (databases, dev
+// servers, SSH, IPC-over-TCP), not just the SNI proxy. Pure function so the
+// rule text is unit-testable.
+func egressFilterRules(proxyPort int) string {
+	return fmt.Sprintf(`table inet agentpen {
+    chain output {
+        type filter hook output priority 0; policy drop;
+        ct state established,related accept
+        oifname "lo" accept
+        ip daddr %s tcp dport %d accept
+        meta l4proto tcp reject with tcp reset
+    }
+}
+`, sandboxGatewayIP, proxyPort)
+}
+
+// installEgressFilter applies the egress nft ruleset inside the current
+// netns. nft inside an unprivileged userns just needs CAP_NET_ADMIN within
+// that userns — which we hold here as the userns root — so this runs
+// without sudo and only affects the sandbox's tables.
+func installEgressFilter(proxyPort int) error {
+	cmd := exec.Command("nft", "-f", "-")
+	cmd.Stdin = strings.NewReader(egressFilterRules(proxyPort))
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("nft load: %w (%s)", err, strings.TrimSpace(string(out)))
+	}
+	return nil
 }
 
 func configureNetns() error {
@@ -112,12 +149,9 @@ func findSandboxIface() (string, error) {
 }
 
 // spawnForwarder launches `agentpen __forwarder` as a separate process and
-// waits briefly for it to bind. The forwarder runs at the same uid as the
-// user's code (kernel-side) — pasta's userns maps only one uid, so we can't
-// give it a distinct identity without /etc/subuid setup. Means user code
-// can SIGKILL it and self-DoS its own outbound. Documented limitation; not
-// a privilege boundary violation since the forwarder cannot route anywhere
-// the kernel /32 route + SNI proxy don't already gate.
+// waits briefly for it to bind. The forwarder runs in pasta's pid namespace;
+// bwrap's --unshare-pid puts user code in a child pid ns where the
+// forwarder's pid isn't visible, so user code can't signal or inspect it.
 //
 // Readiness is racey: dial-loop until the listener accepts, child Wait() in
 // parallel — if the child exits before binding (e.g. EADDRINUSE), we surface

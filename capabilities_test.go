@@ -12,7 +12,7 @@ func TestRequiredFor_Untrusted(t *testing.T) {
 	// capability was added or removed, update the expected set AND think hard
 	// about whether it should be required or optional.
 	req := requiredFor("untrusted")
-	want := []string{"bwrap", "pasta", "ip", "seccomp"}
+	want := []string{"bwrap", "pasta", "nft", "ip", "seccomp"}
 	if len(req) != len(want) {
 		t.Errorf("untrusted requires %d caps, want %d: got %v", len(req), len(want), req)
 	}
@@ -57,6 +57,7 @@ func TestCapabilities_ValidateFor_ReportsAllMissing(t *testing.T) {
 	caps := Capabilities{
 		{Name: "bwrap", Available: false, Reason: "bwrap not found in PATH"},
 		{Name: "pasta", Available: false, Reason: "pasta not found in PATH"},
+		{Name: "nft", Available: true},
 		{Name: "ip", Available: true},
 		{Name: "seccomp", Available: true},
 	}
@@ -89,6 +90,7 @@ func TestCapabilities_ValidateFor_AllPresent(t *testing.T) {
 	caps := Capabilities{
 		{Name: "bwrap", Available: true},
 		{Name: "pasta", Available: true},
+		{Name: "nft", Available: true},
 		{Name: "ip", Available: true},
 		{Name: "seccomp", Available: true},
 	}

@@ -148,6 +148,7 @@ How outbound is constrained:
 
 - **pasta** (from passt) launches the sandbox in a userspace network stack inside an unprivileged user namespace. As userns-root within that namespace we have all caps but only over our own namespace.
 - The interface inside the namespace gets a /32 route to the gateway only — no default route. Anything not destined for the gateway is rejected by the kernel with "no route to host." `CAP_NET_ADMIN` is dropped by bwrap before user code runs, so the agent can't add routes to bypass.
+- An **in-namespace nft rule** narrows that further: only TCP to `gateway:<proxy-port>` is accepted; everything else is rejected. Without this, pasta's `--map-host-loopback` would let the sandbox dial any port on the host's `127.0.0.1` (databases, dev servers, IPC-over-TCP). Rules live in the userns's tables and disappear with the namespace; the binary call needs `CAP_NET_ADMIN` *within* the userns, which we hold for free, so no sudo.
 - An in-namespace **forwarder** binds `127.0.0.1:443` (free to bind low ports as userns-root) and splices to `gateway:<proxy-port>`, where pasta's `--map-host-loopback` translates the gateway to the host's loopback.
 - The host's **SNI proxy** listens on a high port on `127.0.0.1`. For each connection it peeks the TLS ClientHello, extracts SNI, checks against the allowlist, dials the real `<sni>:443`, and splices bytes through. **No TLS termination, no MITM, no decryption** — bytes flow through verbatim and the client validates the real upstream cert.
 - Allowed hostnames in the sandbox `/etc/hosts` map to `127.0.0.1` so apps just dial `<host>:443` normally and reach the forwarder. `/etc/resolv.conf` is blanked, so anything not in `/etc/hosts` fails to resolve.
@@ -159,15 +160,13 @@ End result: the agent dials `api.anthropic.com:443` normally; the connection tra
 - **HTTPS_PROXY + CONNECT proxy** (the original issue's first proposal): would require apps to honor `HTTPS_PROXY`. Node's global fetch ignores it pre-Node-24, and three of four registered agents are Node. Would have forced agentpen to ship a `NODE_OPTIONS` shim — language-specific knowledge leaking into a Go binary. Rejected.
 - **`setcap CAP_NET_BIND_SERVICE` on the agentpen binary** so the proxy could bind `:443` directly: clean operationally but adds a persistent file capability. Rejected because we don't want any persistent host state.
 - **Sysctl `net.ipv4.ip_unprivileged_port_start=0`**: system-wide; affects every process on the box. Rejected as too invasive.
-- **nftables DNAT inside the userns** to redirect `:443 → :high-port`: works without sudo because nft inside a userns just needs the userns's `CAP_NET_ADMIN`, but reintroduces nftables as a runtime dep. Rejected because the issue explicitly wanted nft gone.
+- **Moving the proxy inside the netns**: cleaner-looking, but the proxy needs outbound to the public internet and user code shouldn't have it. They share the netns and the routing table; you'd need per-process route filtering (back to host firewalling) to split them. Rejected.
 
-### Known limitation: forwarder kill
+### nft revisited
 
-Pasta's user namespace maps exactly one uid (the host user). To give the forwarder a different kernel-side uid from the user's code we'd need `/etc/subuid` + `newuidmap` setup — standard rootless-container infrastructure that we deliberately don't require.
+The original issue text wanted nft *gone*. We initially read that as "no nftables binary on the host," removed it from the requirements, and shipped without one. Then we discovered the host-loopback escape — pasta's `--map-host-loopback` doesn't constrain the destination port, so the sandbox could dial `gateway:<any-port>` and hit anything listening on the host's `127.0.0.1`.
 
-Without it, the forwarder runs at the same kernel-side uid as the user's code, so cap-dropped user code can SIGKILL it. That breaks outbound for the rest of the session — a self-DoS, not a privilege boundary violation. The kernel /32 route still blocks any direct egress, and the SNI proxy still gates anything that reaches it.
-
-If this becomes a real complaint, options to add later: an agentpen-on-host watchdog that nsenter's into the netns and revives the forwarder on death, or a `--use-subuid` flag that opts into the multi-uid setup.
+On reflection, "drop nft" was downstream of "drop sudo." The privileged piece was `sudo nft -f` operating on the host's filter tables; nft-the-binary was guilty by association. nft *inside* an unprivileged userns is sudo-free, scoped to the namespace's tables, and tears down with the namespace. Bringing it back to plug the escape is consistent with the original spirit of the change (no host-level privilege at runtime) even though it adds a binary requirement we'd briefly removed.
 
 ## References
 

@@ -33,6 +33,7 @@ func detectCapabilities() Capabilities {
 	}{
 		{"bwrap", "Filesystem & process isolation (bubblewrap)", func() (bool, string) { return bin("bwrap") }},
 		{"pasta", "Userspace network namespace (passt/pasta)", func() (bool, string) { return bin("pasta") }},
+		{"nft", "Egress filtering inside the userns (nftables)", func() (bool, string) { return bin("nft") }},
 		{"ip", "Configure addresses and routes inside the namespace (iproute2)", func() (bool, string) { return bin("ip") }},
 		{"seccomp", "Syscall restriction via BPF", func() (bool, string) {
 			if runtime.GOARCH != "amd64" {
@@ -56,7 +57,7 @@ func requiredFor(profile string) map[string]bool {
 	switch profile {
 	case "untrusted":
 		return map[string]bool{
-			"bwrap": true, "pasta": true, "ip": true, "seccomp": true,
+			"bwrap": true, "pasta": true, "nft": true, "ip": true, "seccomp": true,
 		}
 	}
 	return nil
