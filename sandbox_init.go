@@ -140,22 +140,47 @@ func configureNetns() error {
 	return nil
 }
 
-// findSandboxIface returns the name of the non-loopback interface in the
-// current netns. Pasta creates exactly one tap and names it after the host's
-// outbound interface by default (eno1, enp3s0, eth0, wlan0, …) — host-
-// dependent, so we discover the name at runtime instead of hardcoding it.
+// findSandboxIface returns the name of pasta's tap interface in the current
+// netns. Pasta creates exactly one tap and names it after the host's outbound
+// interface by default (eno1, enp3s0, eth0, wlan0, …) — host-dependent, so we
+// discover the name at runtime instead of hardcoding it.
 func findSandboxIface() (string, error) {
 	ifs, err := net.Interfaces()
 	if err != nil {
 		return "", fmt.Errorf("list interfaces: %w", err)
 	}
+	return selectSandboxIface(ifs)
+}
+
+// selectSandboxIface picks pasta's tap out of an interface list. Pasta's tap
+// is a real ethernet device with a generated MAC; on some kernels (notably
+// when ip6_tunnel is built in or auto-loaded) fresh netnses also contain
+// pseudo-tunnels — ip6tnl0, tunl0, sit0, gre0, gretap0, ip6gre0 — which have
+// empty or all-zero hardware addresses. Filtering on a non-zero MAC selects
+// the tap deterministically without name-matching every kernel pseudo-dev.
+func selectSandboxIface(ifs []net.Interface) (string, error) {
 	for _, i := range ifs {
 		if i.Flags&net.FlagLoopback != 0 {
 			continue
 		}
+		if !hasRealHardwareAddr(i.HardwareAddr) {
+			continue
+		}
 		return i.Name, nil
 	}
-	return "", fmt.Errorf("no non-loopback interface in sandbox netns")
+	return "", fmt.Errorf("no pasta tap interface in sandbox netns")
+}
+
+func hasRealHardwareAddr(hw net.HardwareAddr) bool {
+	if len(hw) == 0 {
+		return false
+	}
+	for _, b := range hw {
+		if b != 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // spawnForwarder launches `agentpen __forwarder` as a separate process and
